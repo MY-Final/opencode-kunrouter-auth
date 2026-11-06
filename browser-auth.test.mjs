@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 
-import { _internal } from "./index.mjs"
+import { KunRouterPlugin, _internal } from "./index.mjs"
 
 const realFetch = globalThis.fetch
 let startBody
@@ -144,6 +144,167 @@ const recovered = await _internal.recoverApiKey("nap_browser_access", "vip")
 assert.deepEqual(recovered, { key: "sk-recovered_key", group: "vip", id: 88 })
 assert.deepEqual(keyCreateBody, { name: "Magpie", group: "vip" })
 assert.equal(await _internal.recoverApiKey("", "vip"), null)
+
+// #11 收紧授权路径：信任域上的非授权路径不再放行。
+assert.equal(_internal.isAllowedAuthorizationURL("https://wcnmb.si/anything"), false)
+assert.equal(
+  _internal.isAllowedAuthorizationURL("https://wcnmb.si/desktop/authorize?mode=register"),
+  true,
+)
+
+// #10 maskKey 与站点的 MaskTokenKey 对齐（站点存的是不带 sk- 的 Key）。
+assert.equal(_internal.maskKey("sk-abcdefghijkl"), "abcd**********ijkl")
+assert.equal(_internal.maskKey("abcde"), "ab****de")
+assert.equal(_internal.maskKey("abc"), "***")
+
+// #6 邀请码不可用时注册入口应隐藏；网络异常按未知、仍然放行。
+globalThis.fetch = async (url) => {
+  if (String(url).includes("/api/invite_codes/public/")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { available: false, reason: "registration_full", remaining_registrations: 0 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+let inviteState = await _internal.inviteCodeState("full-code")
+assert.equal(inviteState.available, false)
+assert.equal(inviteState.reason, "registration_full")
+// 第二次命中缓存，不再打网络（这里的 fetch 会抛错）。
+inviteState = await _internal.inviteCodeState("full-code")
+assert.equal(inviteState.available, false)
+
+globalThis.fetch = async () => new Response("{}", { status: 404 })
+inviteState = await _internal.inviteCodeState("missing-code")
+assert.equal(inviteState.available, false)
+
+globalThis.fetch = async () => {
+  throw new Error("boom")
+}
+inviteState = await _internal.inviteCodeState("offline-code")
+assert.equal(inviteState.available, true)
+assert.equal(inviteState.unknown, true)
+
+// #10 用访问令牌读真实分组，按遮罩匹配。
+globalThis.fetch = async (url) => {
+  if (String(url).includes("/api/desktop/keys")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          items: [
+            { masked_key: "abcd**********ijkl", group: "付费组" },
+            { masked_key: "zzzz**********yyyy", group: "其他" },
+          ],
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+assert.equal(await _internal.currentGroup("nap_x", "sk-abcdefghijkl"), "付费组")
+assert.equal(await _internal.currentGroup("", "sk-abcdefghijkl"), "")
+
+// #4 流式响应里的 usage.quota 也要记下来；#7 单位跟随站点币种。
+globalThis.fetch = async (url) => {
+  const u = String(url)
+  if (u.endsWith("/api/status")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { quota_per_unit: 500000, custom_currency_symbol: "🥚", system_name: "KunRouter" },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.includes("/api/desktop/keys")) {
+    return new Response(JSON.stringify({ success: true, data: { items: [] } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+  if (u.endsWith("/api/user/self")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { id: 1, username: "u", group: "免费鸡蛋", quota: 500000, used_quota: 250000 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+const sse = new Response(
+  'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+    'data: {"usage":{"quota":{"percent":42,"reset_at":2000000000}}}\n\n' +
+    "data: [DONE]\n",
+  { status: 200, headers: { "content-type": "text/event-stream" } },
+)
+await _internal.captureQuota(sse, "sk-ssekey")
+const usageHooks = await KunRouterPlugin({})
+const usage = await usageHooks.auth.usage(async () => ({
+  type: "api",
+  key: "sk-ssekey",
+  metadata: { apiKey: "sk-ssekey", accessToken: "nap_x" },
+}))
+assert.equal(usage.windows.find((w) => w.name === "本期配额")?.used, 42)
+assert.equal(usage.windows.find((w) => w.name === "钱包")?.unit, "🥚")
+assert.equal(usage.plan, "免费鸡蛋")
+
+// #5 只有访问令牌、没有 sk- 时，loader 直接返回一个清楚的 401，而不是打出去被拒。
+const viewOnlyLoader = await usageHooks.auth.loader(async () => ({
+  type: "api",
+  key: "nap_only_token",
+  metadata: { accessToken: "nap_only_token" },
+}))
+const blocked = await viewOnlyLoader.fetch("https://direct.wcnmb.fun/v1/chat/completions", {
+  method: "POST",
+})
+assert.equal(blocked.status, 401)
+assert.match((await blocked.json()).error.message, /访问令牌/)
+
+// #9 直连域名网络层挂了，回退一次主站。
+let directHits = 0
+let siteHits = 0
+globalThis.fetch = async (url) => {
+  const u = String(url)
+  if (u.startsWith("https://direct.wcnmb.fun")) {
+    directHits++
+    throw new Error("ECONNREFUSED")
+  }
+  if (u.startsWith("https://wcnmb.si/v1")) {
+    siteHits++
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+const fallbackLoader = await usageHooks.auth.loader(async () => ({
+  type: "api",
+  key: "sk-directkey",
+  metadata: { apiKey: "sk-directkey" },
+}))
+const fallbackRes = await fallbackLoader.fetch(
+  "https://direct.wcnmb.fun/v1/chat/completions",
+  { method: "POST", body: "{}" },
+)
+assert.equal(fallbackRes.status, 200)
+assert.equal(directHits, 1)
+assert.equal(siteHits, 1)
+
+// #12 registration_entry 开关能直接关掉注册入口，不用改代码。
+const noRegister = await KunRouterPlugin({
+  magpie: { option: (_provider, key) => ({ registration_entry: false })[key] },
+})
+assert.equal(noRegister.auth.methods.some((m) => /注册/.test(m.label || "")), false)
+// 默认（邀请码可用 / 未知）时注册入口存在。
+assert.equal(usageHooks.auth.methods.some((m) => /注册/.test(m.label || "")), true)
 
 globalThis.fetch = realFetch
 console.log("browser authorization tests passed")

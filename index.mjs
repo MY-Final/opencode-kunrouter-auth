@@ -14,9 +14,12 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.5.0"
+const VERSION = "0.6.0"
 const MAGPIE_CLIENT_ID = "magpie"
-const INVITE_CODE = "shjglbwadfbhblqvwcpqoqbo"
+// 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
+const INVITE_CODE = (
+  process.env.KUNROUTER_INVITE_CODE ?? "shjglbwadfbhblqvwcpqoqbo"
+).trim()
 const AUTHORIZATION_ORIGIN =
   process.env.KUNROUTER_AUTH_ORIGIN?.replace(/\/+$/, "") ||
   "https://kuncode.120403.xyz"
@@ -32,6 +35,11 @@ const TRUSTED_AUTHORIZATION_DOMAINS = [
 // new-api 的默认换算：500000 quota = 1 美元，站点 /api/status 会覆盖。
 const DEFAULT_QUOTA_PER_UNIT = 500000
 const STATUS_TTL_MS = 10 * 60 * 1000
+// 站点 /api 请求统一超时，免得网络卡住时额度卡和签到一起挂死。
+const REQUEST_TIMEOUT_MS = 10000
+const INVITE_STATUS_TTL_MS = 5 * 60 * 1000
+// 插件加载时要等这次邀请码检查，超时放短一点，别因为站点慢拖住整个插件。
+const INVITE_CHECK_TIMEOUT_MS = 2500
 
 // 拉不到模型列表时的兜底，名字稳定，不至于让供应商空着。
 const DEFAULT_MODELS = {
@@ -47,6 +55,8 @@ const baseModel = {
 
 // 站点级配置（币种符号、quota 换算）不属于任何账号，缓存这里是安全的。
 let statusCache = { at: 0, value: null }
+// 邀请码是否还能用，也做短缓存，避免每次加载插件都打一次站点的脸。
+let inviteCache = { code: "", at: 0, value: null }
 
 // new-api 在每次 chat 响应的 usage.quota 里塞了本期百分比和重置时间。
 // 没有访问令牌时，这条就是唯一能看到的额度信息，按令牌分开存，只留最近一条。
@@ -62,11 +72,54 @@ function rememberQuota(token, quota) {
   })
 }
 
+// 站点把本期用量百分比塞在响应体的 usage.quota 里。非流式好办，
+// 流式（SSE）要扫最后一个 data: 事件，否则额度卡片永远看不到这一栏。
+function captureQuota(res, key) {
+  try {
+    const ct = res.headers.get("content-type") || ""
+    if (ct.includes("application/json")) {
+      return res
+        .clone()
+        .json()
+        .then((body) => rememberQuota(key, body?.usage?.quota))
+        .catch(() => {})
+    }
+    if (ct.includes("text/event-stream")) {
+      return res
+        .clone()
+        .text()
+        .then((text) => {
+          let quota
+          for (const line of text.split("\n")) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith("data:")) continue
+            const payload = trimmed.slice(5).trim()
+            if (!payload || payload === "[DONE]") continue
+            try {
+              const event = JSON.parse(payload)
+              if (event?.usage?.quota) quota = event.usage.quota
+            } catch {
+              /* 非法 JSON 的中间事件跳过 */
+            }
+          }
+          if (quota) rememberQuota(key, quota)
+        })
+        .catch(() => {})
+    }
+  } catch {
+    /* 记不上不影响请求本身 */
+  }
+  return Promise.resolve()
+}
+
 async function siteStatus() {
   const now = Date.now()
   if (statusCache.value && now - statusCache.at < STATUS_TTL_MS) return statusCache.value
   try {
-    const res = await fetch(`${SITE}/api/status`, { headers: clientHeaders() })
+    const res = await fetch(`${SITE}/api/status`, {
+      headers: clientHeaders(),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
     if (!res.ok) return statusCache.value ?? {}
     const data = (await res.json())?.data ?? {}
     const value = {
@@ -85,6 +138,78 @@ async function siteStatus() {
 
 function clientHeaders() {
   return { "x-kunrouter-client": `opencode-kunrouter-auth/${VERSION}` }
+}
+
+// 站点公开接口 GET /api/invite_codes/public/:code 会告诉我们这个码还能不能用。
+// 用不了（禁用 / 过期 / 名额满）就别再把注册入口摆出来，省得用户点进去才看到报错。
+// 网络抖动时按「未知」处理、仍然展示入口，宁可多给一次机会也别把能用的码藏了。
+async function inviteCodeState(code) {
+  if (!code) return { available: false, unknown: false }
+  const now = Date.now()
+  if (inviteCache.code === code && now - inviteCache.at < INVITE_STATUS_TTL_MS) {
+    return inviteCache.value
+  }
+  let value
+  try {
+    const res = await fetch(
+      `${SITE}/api/invite_codes/public/${encodeURIComponent(code)}`,
+      { headers: clientHeaders(), signal: AbortSignal.timeout(INVITE_CHECK_TIMEOUT_MS) },
+    )
+    if (res.status === 404) {
+      value = { available: false, unknown: false, reason: "invalid" }
+    } else if (!res.ok) {
+      value = { available: true, unknown: true }
+    } else {
+      const body = await res.json().catch(() => null)
+      const data = body?.data
+      if (!data) {
+        value = { available: true, unknown: true }
+      } else {
+        value = {
+          available: data.available === true,
+          unknown: false,
+          reason: typeof data.reason === "string" ? data.reason : "",
+          remaining: Number(data.remaining_registrations) || 0,
+        }
+      }
+    }
+  } catch {
+    value = { available: true, unknown: true }
+  }
+  inviteCache = { code, at: now, value }
+  return value
+}
+
+// 站点存的是不带 sk- 前缀的 Key，遮罩也按去前缀之后算，用来和列表里的 masked_key 对上。
+function maskKey(key) {
+  if (!key) return ""
+  const raw = key.startsWith("sk-") ? key.slice(3) : key
+  if (raw.length <= 4) return "*".repeat(raw.length)
+  if (raw.length <= 8) return `${raw.slice(0, 2)}****${raw.slice(-2)}`
+  return `${raw.slice(0, 4)}**********${raw.slice(-4)}`
+}
+
+// 额度卡上的分组别用授权时的快照：用户可能在控制台改过 Key 的分组。
+// 拿访问令牌列表里按遮罩匹配出真实分组，读不到就交给调用方退回快照。
+async function currentGroup(accessToken, apiKey) {
+  if (!accessToken) return ""
+  try {
+    const res = await fetch(`${SITE}/api/desktop/keys?p=1&page_size=100`, {
+      headers: authHeaders(accessToken),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
+    if (!res.ok) return ""
+    const body = await res.json().catch(() => null)
+    const items = body?.data?.items
+    if (!Array.isArray(items) || items.length === 0) return ""
+    const masked = maskKey(apiKey)
+    const match =
+      (masked && items.find((item) => item?.masked_key === masked)) ||
+      (items.length === 1 ? items[0] : null)
+    return typeof match?.group === "string" ? match.group : ""
+  } catch {
+    return ""
+  }
 }
 
 function authHeaders(key) {
@@ -154,9 +279,13 @@ function isAllowedAuthorizationURL(value) {
     const trustedHost = TRUSTED_AUTHORIZATION_DOMAINS.some(
       (domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`),
     )
+    // 授权只应落在授权页，不能是信任域上的任意路径。
+    // 注册和登录走同一个 /desktop/authorize，用 query 区分，所以一条路径就够。
+    const allowedPath = url.pathname === "/desktop/authorize"
     return (
       (url.protocol === "https:" || localHTTP) &&
-      trustedHost
+      trustedHost &&
+      allowedPath
     )
   } catch {
     return false
@@ -349,7 +478,10 @@ async function startBrowserAuthorization(signal, options = {}) {
 
 // /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
 async function listModels(apiKey) {
-  const res = await fetch(`${API}/v1/models`, { headers: authHeaders(apiKey) })
+  const res = await fetch(`${API}/v1/models`, {
+    headers: authHeaders(apiKey),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  })
   return { ok: res.ok, status: res.status, res }
 }
 
@@ -357,7 +489,10 @@ async function listModels(apiKey) {
 async function fetchSelf(key) {
   let res
   try {
-    res = await fetch(`${SITE}/api/user/self`, { headers: authHeaders(key) })
+    res = await fetch(`${SITE}/api/user/self`, {
+      headers: authHeaders(key),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    })
   } catch (e) {
     return { error: `KunRouter 连不上：${e}` }
   }
@@ -438,6 +573,18 @@ export const KunRouterPlugin = async (input) => {
   // 直连域名绕开 Cloudflare 的 100 秒上限；关掉就走主站 /v1。
   const apiBase = () => (opt("direct_api", true) ? API : SITE)
 
+  // 注册入口要先确认邀请码还能用，用不了就别把入口摆出来（#6）。
+  // 关掉 registration_entry 开关也能隐藏它（#12）。
+  const inviteState =
+    Boolean(INVITE_CODE) && opt("registration_entry", true)
+      ? await inviteCodeState(INVITE_CODE)
+      : null
+  const showInvite = Boolean(inviteState?.available)
+  const inviteLabel =
+    Number(inviteState?.remaining) > 0
+      ? `没有账号？注册并领取鸡蛋（剩 ${inviteState.remaining} 个名额）`
+      : "没有账号？注册并领取鸡蛋（仅新用户）"
+
   return {
   config: async (cfg) => {
     cfg.provider ??= {}
@@ -472,6 +619,13 @@ export const KunRouterPlugin = async (input) => {
           "开（默认）：把最近一次对话里站点回报的用量百分比单独显示一栏。关掉就只看钱包余额。",
         default: true,
       },
+      {
+        key: "registration_entry",
+        label: "显示注册入口",
+        description:
+          "开（默认）：登录页显示「没有账号？注册并领取鸡蛋」，邀请码不可用（禁用 / 过期 / 名额满）时自动隐藏。关掉就完全不提注册。",
+        default: true,
+      },
     ],
     methods: [
       {
@@ -481,11 +635,11 @@ export const KunRouterPlugin = async (input) => {
           return startBrowserAuthorization(signal)
         },
       },
-      ...(INVITE_CODE
+      ...(showInvite
         ? [
             {
               type: "oauth",
-              label: "没有账号？注册并领取鸡蛋",
+              label: inviteLabel,
               async authorize(_inputs, { signal } = {}) {
                 return startBrowserAuthorization(signal, { registration: true })
               },
@@ -548,20 +702,59 @@ export const KunRouterPlugin = async (input) => {
       const auth = await getAuth()
       if (auth?.type !== "api") return {}
       const client = input?.client
-      let key = apiKeyOf(auth) || tokenOf(auth)
-      const usedApiKey = Boolean(apiKeyOf(auth))
+      const apiKey = apiKeyOf(auth)
+      // 只有访问令牌、没有 sk- 密钥时，/v1 必然 401（访问令牌只能读 /api）。
+      // 与其让请求打出去 401，不如当场给一句能看懂的话：这把账号只能看余额和签到。
+      if (!apiKey) {
+        return {
+          baseURL: `${apiBase()}/v1`,
+          async fetch() {
+            return new Response(
+              JSON.stringify({
+                error: {
+                  type: "invalid_request_error",
+                  message:
+                    "这个账号只填了访问令牌，没有 sk- API 密钥，不能调用模型。请在 KunRouter 后台「令牌」新建一把 sk- 密钥，或改用浏览器授权。",
+                },
+              }),
+              { status: 401, headers: { "content-type": "application/json" } },
+            )
+          },
+        }
+      }
+      let key = apiKey
       return {
         baseURL: `${apiBase()}/v1`,
         async fetch(input, init) {
-          const send = (secret) => {
+          const send = (secret, base) => {
             const headers = new Headers(init?.headers)
             headers.set("authorization", `Bearer ${secret}`)
             for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
-            return fetch(input, { ...init, headers })
+            // loader 已经用 apiBase 拼好完整 URL，回退时把直连域名换回主站。
+            const target =
+              base === SITE && typeof input === "string" && input.startsWith(API)
+                ? `${SITE}${input.slice(API.length)}`
+                : input
+            return fetch(target, { ...init, headers })
           }
-          let res = await send(key)
+          let res
+          try {
+            res = await send(key, apiBase())
+          } catch (error) {
+            // 直连域名网络层挂了（DNS / 连不上）时回退一次主站，别让明明还能用的站白等。
+            const replayable =
+              init?.body == null ||
+              typeof init.body === "string" ||
+              init.body instanceof Uint8Array ||
+              init.body instanceof ArrayBuffer
+            if (apiBase() === API && replayable) {
+              res = await send(key, SITE)
+            } else {
+              throw error
+            }
+          }
           // Key 被控制台删掉后 /v1 会直接 401。访问令牌还能用就重签一把再试。
-          if (res.status === 401 && usedApiKey) {
+          if (res.status === 401) {
             const recovered = await recoverApiKey(tokenOf(auth), auth?.metadata?.group)
             if (recovered?.key) {
               key = recovered.key
@@ -572,23 +765,11 @@ export const KunRouterPlugin = async (input) => {
                 typeof init.body === "string" ||
                 init.body instanceof Uint8Array ||
                 init.body instanceof ArrayBuffer
-              if (replayable) res = await send(key)
+              if (replayable) res = await send(key, apiBase())
             }
           }
-          // 顺手记一下额度：new-api 把本期百分比放在 usage.quota 里，
-          // 只解析 JSON 响应，流式的不碰，失败就算了。
-          try {
-            const ct = res.headers.get("content-type") || ""
-            if (ct.includes("application/json")) {
-              res
-                .clone()
-                .json()
-                .then((body) => rememberQuota(key, body?.usage?.quota))
-                .catch(() => {})
-            }
-          } catch {
-            /* 记不上不影响请求本身 */
-          }
+          // 顺手记一下额度：new-api 把本期百分比放在 usage.quota 里，JSON 和 SSE 都解析。
+          captureQuota(res, key)
           return res
         },
       }
@@ -606,6 +787,8 @@ export const KunRouterPlugin = async (input) => {
       const status = await siteStatus()
       const unit = status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT
       const sym = status.symbol || "$"
+      // 窗口单位跟着站点币种走（本站是 🥚），别写死成美元。
+      const currencyUnit = sym && sym !== "$" ? sym : "USD"
       const money = (n) => `${sym} ${n.toFixed(2)}`
       const windows = []
 
@@ -644,7 +827,7 @@ export const KunRouterPlugin = async (input) => {
       windows.unshift({
         name: "钱包",
         balance: available,
-        unit: "USD",
+        unit: currencyUnit,
         display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent / unit)}`,
       })
 
@@ -652,11 +835,21 @@ export const KunRouterPlugin = async (input) => {
       windows.push({
         name: "说明",
         aside: true,
-        display: `余额取自 /api/user/self，按 ${unit} quota 兑 1 美元；本期配额是最近一次对话时站点回报的百分比`,
+        display: `余额取自 /api/user/self，按 ${unit} quota 兑 1 个 ${sym}；本期配额是最近一次对话时站点回报的百分比`,
       })
 
+      // 分组别用授权时的快照：用户可能在控制台改过 Key 的分组。读一次真实分组，读不到再退回。
+      const liveGroup = apiKey ? await currentGroup(token, apiKey) : ""
+      const plan = liveGroup
+        ? liveGroup
+        : self.user?.group
+          ? self.user.group
+          : auth.metadata?.group
+            ? `${auth.metadata.group}（授权时）`
+            : "默认分组"
+
       return {
-        plan: auth.metadata?.group || self.user?.group || "默认分组",
+        plan,
         user: self.user?.email || self.user?.username || undefined,
         balance: money(available),
         windows,
@@ -675,6 +868,7 @@ export const KunRouterPlugin = async (input) => {
           method: "POST",
           headers: { ...authHeaders(key), "content-type": "application/json" },
           body: "{}",
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         })
       } catch (e) {
         return { outcome: "failed", message: `KunRouter 连不上：${e}` }
@@ -711,7 +905,10 @@ export const KunRouterPlugin = async (input) => {
 
       let list
       try {
-        const res = await fetch(`${API}/v1/models`, { headers: authHeaders(key) })
+        const res = await fetch(`${API}/v1/models`, {
+          headers: authHeaders(key),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        })
         if (!res.ok) return provider.models
         const body = await res.json()
         list = Array.isArray(body?.data) ? body.data : []
@@ -735,8 +932,12 @@ export const KunRouterPlugin = async (input) => {
 export const _internal = {
   INVITE_CODE,
   apiKeyOf,
+  captureQuota,
+  currentGroup,
   fetchSelf,
+  inviteCodeState,
   isAllowedAuthorizationURL,
+  maskKey,
   recoverApiKey,
   siteStatus,
   stableInstallationId,

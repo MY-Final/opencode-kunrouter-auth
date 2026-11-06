@@ -25,6 +25,17 @@ magpie plugin add ./opencode-kunrouter-auth
 
 下次请求 401 时插件会用访问令牌自动重签一把同名 Key 并写回 Magpie，不需要重新授权；访问令牌也失效才需要重登。
 
+### 想换一把 Key？
+
+插件页面只能整组账号替换，没有单独改 Key 的输入框。直接重新登录不会覆盖，会多出一个 `kunrouter#xxxxxx` 账号，所以要先登出再登录：
+
+```sh
+magpie plugin logout kunrouter
+magpie plugin login kunrouter
+```
+
+只想换 `sk-` 不换账号：在控制台删掉旧 Key，等插件 401 后自动重签。
+
 ## 选项
 
 | 选项 | 默认 | 干什么 |

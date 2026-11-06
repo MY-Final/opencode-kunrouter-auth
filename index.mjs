@@ -75,6 +75,22 @@ function tokenOf(auth) {
   return typeof auth?.key === "string" ? auth.key.trim() : ""
 }
 
+// new-api 有两套凭据：访问令牌只能读 /api（余额、签到），sk- 密钥只能调 /v1。
+// 登录时两样都收，访问令牌当主 key 存，sk- 放 metadata 里给模型请求用。
+function apiKeyOf(auth) {
+  const meta = auth?.metadata
+  const fromMeta = typeof meta?.apiKey === "string" ? meta.apiKey.trim() : ""
+  if (fromMeta) return fromMeta
+  const key = tokenOf(auth)
+  return key.startsWith("sk-") ? key : ""
+}
+
+// /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
+async function listModels(apiKey) {
+  const res = await fetch(`${API}/v1/models`, { headers: authHeaders(apiKey) })
+  return { ok: res.ok, status: res.status, res }
+}
+
 // /api/user/self：余额查这里，也是校验令牌是否还有效的唯一办法。
 async function fetchSelf(key) {
   let res
@@ -125,28 +141,50 @@ export const KunRouterPlugin = async () => ({
         // 唯一可行的自动化登录：后台「设置 → 访问令牌」生成的 PAT。
         // 密码登录要过 Turnstile，插件里做不了，也不该要用户把密码交出来。
         type: "api",
-        label: "访问令牌",
-        placeholder: "在 KunRouter 后台「设置 → 访问令牌」生成",
+        label: "访问令牌 + API 密钥",
+        placeholder: "两把钥匙分别粘贴",
         prompts: [
           {
             type: "password",
-            key: "token",
-            message: "KunRouter 访问令牌",
-            placeholder: "粘贴令牌，形如 32 位以上字符串",
+            key: "accessToken",
+            message: "访问令牌（后台「个人设置 → 安全设置」生成，用来读余额和签到）",
+            placeholder: "不是 sk- 开头的那串",
             validate: (v) => (v && v.trim().length >= 8 ? undefined : "令牌太短，先确认复制全了"),
+          },
+          {
+            type: "password",
+            key: "apiKey",
+            message: "API 密钥（后台「令牌」页生成，sk- 开头，用来请求模型；留空就只能看余额）",
+            placeholder: "sk-…",
+            validate: (v) => (!v || v.trim().startsWith("sk-") ? undefined : "API 密钥是 sk- 开头的，别把访问令牌填这儿"),
           },
         ],
         authorize: async (inputs) => {
-          const token = String(inputs?.token ?? "").trim()
-          if (!token) return { type: "failed", error: "令牌不能为空" }
+          const token = String(inputs?.accessToken ?? "").trim()
+          const apiKey = String(inputs?.apiKey ?? "").trim()
+          if (!token) return { type: "failed", error: "访问令牌不能为空" }
+
           const self = await fetchSelf(token)
-          if (self.error) return { type: "failed", error: self.error }
+          if (self.error) {
+            return {
+              type: "failed",
+              error: `${self.error}（这一栏要的是后台安全设置生成的访问令牌，不是 sk- 开头的 API 密钥）`,
+            }
+          }
+
+          // 顺手验一下 sk- 能不能列模型，省得进了列表才发现拉不到。
+          if (apiKey) {
+            const probe = await listModels(apiKey).catch(() => null)
+            if (!probe) return { type: "failed", error: "API 密钥连不上 /v1/models，确认一下是不是复制全了" }
+            if (!probe.ok) return { type: "failed", error: `API 密钥被拒绝（HTTP ${probe.status}）` }
+          }
+
           const name = self.user?.email || self.user?.username || self.user?.display_name
           return {
             type: "success",
             key: token,
             accountId: self.user?.id != null ? String(self.user.id) : undefined,
-            metadata: { mode: "token", username: name },
+            metadata: { mode: "token", username: name, apiKey: apiKey || undefined },
           }
         },
       },
@@ -155,7 +193,7 @@ export const KunRouterPlugin = async () => ({
     async loader(getAuth) {
       const auth = await getAuth()
       if (auth?.type !== "api") return {}
-      const key = tokenOf(auth)
+      const key = apiKeyOf(auth) || tokenOf(auth)
       return {
         baseURL: `${API}/v1`,
         async fetch(input, init) {
@@ -281,7 +319,7 @@ export const KunRouterPlugin = async () => ({
     id: PROVIDER,
     async models(provider, { auth } = {}) {
       if (auth?.type !== "api") return provider.models
-      const key = tokenOf(auth)
+      const key = apiKeyOf(auth)
       if (!key) return provider.models
 
       let list

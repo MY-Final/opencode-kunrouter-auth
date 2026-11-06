@@ -1,9 +1,12 @@
 {
   "name": "opencode-kunrouter-auth",
-  "version": "0.1.0",
-  "description": "KunRouter (wcnmb.si) provider for OpenCode and magpie — access-token sign-in, wallet quota and daily check-in",
+  "version": "0.3.0",
+  "description": "KunRouter (wcnmb.si) provider for OpenCode and magpie — browser sign-in, wallet quota and daily check-in",
   "type": "module",
   "main": "./index.mjs",
+  "scripts": {
+    "test": "node browser-auth.test.mjs"
+  },
   "files": ["index.mjs", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "kunrouter", "new-api"],
   "license": "MIT",
@@ -13,8 +16,8 @@
     "icon": "https://wcnmb.si/logo.png",
     "maxConcurrency": 8,
     "summary": {
-      "en": "KunRouter relay: access-token sign-in, wallet balance and daily check-in.",
-      "zh": "KunRouter 中转：访问令牌登录、钱包余额与每日签到。"
+      "en": "KunRouter relay: browser sign-in, wallet balance and daily check-in.",
+      "zh": "KunRouter 中转：浏览器一键授权、钱包余额与每日签到。"
     }
   }
 }

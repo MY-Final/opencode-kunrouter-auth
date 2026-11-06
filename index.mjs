@@ -28,6 +28,20 @@ const baseModel = {
 // 站点级配置（币种符号、quota 换算）不属于任何账号，缓存这里是安全的。
 let statusCache = { at: 0, value: null }
 
+// new-api 在每次 chat 响应的 usage.quota 里塞了本期百分比和重置时间。
+// 没有访问令牌时，这条就是唯一能看到的额度信息，按令牌分开存，只留最近一条。
+const lastQuota = new Map()
+
+function rememberQuota(token, quota) {
+  const percent = Number(quota?.percent)
+  if (!token || !Number.isFinite(percent)) return
+  lastQuota.set(token, {
+    percent,
+    resetAt: Number(quota?.reset_at) || 0,
+    at: Date.now(),
+  })
+}
+
 async function siteStatus() {
   const now = Date.now()
   if (statusCache.value && now - statusCache.at < STATUS_TTL_MS) return statusCache.value
@@ -75,6 +89,13 @@ async function fetchSelf(key) {
   if (!res.ok) return { error: `KunRouter 返回 ${res.status}` }
   const body = await res.json().catch(() => null)
   if (!body?.success || !body?.data) {
+    const code = String(body?.code || body?.message_key || "")
+    if (code.includes("ACCESS_TOKEN_LEGACY_RETIRED")) {
+      return { error: "这个令牌是旧的访问令牌，站点已经退役了；模拟账号管理页 → 安全设置里重新生成一个", expired: true }
+    }
+    if (code.includes("AUTH_UNAUTHORIZED")) {
+      return { error: "这个令牌不是访问令牌；余额要后台安全设置里生成的那种，不是 sk- 开头的 API 密钥", expired: true }
+    }
     return { error: body?.message || "KunRouter 返回了读不懂的内容" }
   }
   return { user: body.data }
@@ -141,7 +162,22 @@ export const KunRouterPlugin = async () => ({
           const headers = new Headers(init?.headers)
           headers.set("authorization", `Bearer ${key}`)
           for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
-          return fetch(input, { ...init, headers })
+          const res = await fetch(input, { ...init, headers })
+          // 顺手记一下额度：new-api 把本期百分比放在 usage.quota 里，
+          // 只解析 JSON 响应，流式的不碰，失败就算了。
+          try {
+            const ct = res.headers.get("content-type") || ""
+            if (ct.includes("application/json")) {
+              res
+                .clone()
+                .json()
+                .then((body) => rememberQuota(key, body?.usage?.quota))
+                .catch(() => {})
+            }
+          } catch {
+            /* 记不上不影响请求本身 */
+          }
+          return res
         },
       }
     },
@@ -155,6 +191,24 @@ export const KunRouterPlugin = async () => ({
 
       const self = await fetchSelf(key)
       if (self.error) {
+        // 只填了 sk- API 密钥的账号查不到钱包，但每次对话响应里带本期百分比，
+        // 有这条就先拿它顶着，免得额度卡片一片空白。
+        const seen = lastQuota.get(key)
+        if (seen) {
+          const resetHint = seen.resetAt
+            ? new Date(seen.resetAt * 1000).toLocaleString("zh-CN", { hour12: false })
+            : ""
+          return {
+            plan: "API 密钥",
+            windows: [
+              {
+                name: "本期配额",
+                ...(seen.resetAt ? { resetsAt: new Date(seen.resetAt * 1000).toISOString() } : {}),
+                display: `本期配额 ${seen.percent}%${resetHint ? ` · ${resetHint} 重置` : ""} · 钱包余额需访问令牌`,
+              },
+            ],
+          }
+        }
         const out = { error: self.error, windows: [] }
         if (self.expired) out.signIn = "expired"
         return out

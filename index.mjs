@@ -117,14 +117,23 @@ async function fetchSelf(key) {
   return { user: body.data }
 }
 
-export const KunRouterPlugin = async () => ({
+export const KunRouterPlugin = async (input) => {
+  // magpie 的选项框：plugins.json 里这一项的 options，按供应商 id 读。
+  const opt = (key, fallback) => {
+    const v = input?.magpie?.option?.(PROVIDER, key)
+    return typeof v === "boolean" ? v : fallback
+  }
+  // 直连域名绕开 Cloudflare 的 100 秒上限；关掉就走主站 /v1。
+  const apiBase = () => (opt("direct_api", true) ? API : SITE)
+
+  return {
   config: async (cfg) => {
     cfg.provider ??= {}
     cfg.provider[PROVIDER] ??= {
       name: "KunRouter",
       npm: "@ai-sdk/openai-compatible",
-      api: `${API}/v1`,
-      endpoint: `${API}/v1`,
+      api: `${apiBase()}/v1`,
+      endpoint: `${apiBase()}/v1`,
       website: SITE,
       keys: `${SITE}/console/token`,
       models: Object.fromEntries(
@@ -136,6 +145,22 @@ export const KunRouterPlugin = async () => ({
   auth: {
     provider: PROVIDER,
     maxConcurrency: 8,
+    options: [
+      {
+        key: "direct_api",
+        label: "走直连域名",
+        description:
+          "开（默认）：模型请求打到 direct.wcnmb.fun，绕开 Cloudflare 的 100 秒上限，长任务不容易被掐。关掉就走 wcnmb.si/v1，连通性更保险但流式长请求可能断。",
+        default: true,
+      },
+      {
+        key: "period_window",
+        label: "显示本期配额",
+        description:
+          "开（默认）：把最近一次对话里站点回报的用量百分比单独显示一栏。关掉就只看钱包余额。",
+        default: true,
+      },
+    ],
     methods: [
       {
         // 唯一可行的自动化登录：后台「设置 → 访问令牌」生成的 PAT。
@@ -195,7 +220,7 @@ export const KunRouterPlugin = async () => ({
       if (auth?.type !== "api") return {}
       const key = apiKeyOf(auth) || tokenOf(auth)
       return {
-        baseURL: `${API}/v1`,
+        baseURL: `${apiBase()}/v1`,
         async fetch(input, init) {
           const headers = new Headers(init?.headers)
           headers.set("authorization", `Bearer ${key}`)
@@ -237,7 +262,7 @@ export const KunRouterPlugin = async () => ({
 
       // 本期配额：new-api 把 percent 和 reset_at 塞在每次对话响应里，
       // 记在 sk- 密钥名下，所以拿 apiKeyOf 去查（不是访问令牌）。
-      const seen = lastQuota.get(apiKey || token)
+      const seen = opt("period_window", true) ? lastQuota.get(apiKey || token) : undefined
       if (seen) {
         const resetHint = seen.resetAt
           ? new Date(seen.resetAt * 1000).toLocaleString("zh-CN", { hour12: false })
@@ -272,6 +297,13 @@ export const KunRouterPlugin = async () => ({
         balance: available,
         unit: "USD",
         display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent / unit)}`,
+      })
+
+      // 一行说明，省得对着两个窗口猜哪个是钱、哪个是百分比。
+      windows.push({
+        name: "说明",
+        aside: true,
+        display: `余额取自 /api/user/self，按 ${unit} quota 兑 1 美元；本期配额是最近一次对话时站点回报的百分比`,
       })
 
       return {
@@ -347,7 +379,8 @@ export const KunRouterPlugin = async () => ({
       return Object.keys(out).length ? out : provider.models
     },
   },
-})
+  }
+}
 
 // 给测试用，别从入口导出别的函数：magpie 会把每个导出函数都当插件调用。
 export const _internal = { fetchSelf, siteStatus, DEFAULT_MODELS, DEFAULT_QUOTA_PER_UNIT }

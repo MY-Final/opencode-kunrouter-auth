@@ -14,8 +14,20 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.3.0"
+const VERSION = "0.4.0"
 const MAGPIE_CLIENT_ID = "magpie"
+const INVITE_CODE = "shjglbwadfbhblqvwcpqoqbo"
+const AUTHORIZATION_ORIGIN =
+  process.env.KUNROUTER_AUTH_ORIGIN?.replace(/\/+$/, "") ||
+  "https://kuncode.120403.xyz"
+const TRUSTED_AUTHORIZATION_DOMAINS = [
+  "wcnmb.si",
+  "wcnmb.fun",
+  "kuncode.120403.xyz",
+  new URL(SITE).hostname,
+  new URL(API).hostname,
+  new URL(AUTHORIZATION_ORIGIN).hostname,
+]
 
 // new-api 的默认换算：500000 quota = 1 美元，站点 /api/status 会覆盖。
 const DEFAULT_QUOTA_PER_UNIT = 500000
@@ -133,6 +145,24 @@ function sameSecret(left, right) {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+function isAllowedAuthorizationURL(value) {
+  try {
+    const url = new URL(String(value || ""))
+    const localHTTP =
+      url.protocol === "http:" &&
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost")
+    const trustedHost = TRUSTED_AUTHORIZATION_DOMAINS.some(
+      (domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`),
+    )
+    return (
+      (url.protocol === "https:" || localHTTP) &&
+      trustedHost
+    )
+  } catch {
+    return false
+  }
+}
+
 async function responseJSON(res) {
   const body = await res.json().catch(() => null)
   if (!res.ok || body?.success !== true) {
@@ -223,7 +253,7 @@ function waitForLoopbackCallback(server, expectedState, signal) {
   })
 }
 
-async function startBrowserAuthorization(signal) {
+async function startBrowserAuthorization(signal, options = {}) {
   const server = createServer()
   try {
     const port = await listenLoopback(server)
@@ -246,12 +276,13 @@ async function startBrowserAuthorization(signal) {
       signal,
     })
     const started = await responseJSON(res)
-    const authorizationURL = new URL(String(started?.authorization_url || ""))
-    if (
-      !["https:", "http:"].includes(authorizationURL.protocol) ||
-      authorizationURL.origin !== new URL(SITE).origin
-    ) {
+    if (!isAllowedAuthorizationURL(started?.authorization_url)) {
       throw new Error("KunRouter 返回了无效的授权地址")
+    }
+    const authorizationURL = new URL(started.authorization_url)
+    if (options.registration) {
+      authorizationURL.searchParams.set("mode", "register")
+      authorizationURL.searchParams.set("invite_code", INVITE_CODE)
     }
     const callbackPromise = waitForLoopbackCallback(server, state, signal)
     const closeOnAbort = () => server.close()
@@ -259,7 +290,9 @@ async function startBrowserAuthorization(signal) {
     callbackPromise.catch(() => {})
     return {
       url: authorizationURL.toString(),
-      instructions: "请在浏览器中登录 KunRouter 并确认授权；完成后 Magpie 会自动继续。",
+      instructions: options.registration
+        ? "没有账号时，浏览器会打开注册页并自动填入 Magpie 邀请码；注册并登录后会自动继续授权。"
+        : "请在浏览器中登录 KunRouter 并确认授权；完成后 Magpie 会自动继续。",
       method: "auto",
       async callback() {
         try {
@@ -398,6 +431,17 @@ export const KunRouterPlugin = async (input) => {
           return startBrowserAuthorization(signal)
         },
       },
+      ...(INVITE_CODE
+        ? [
+            {
+              type: "oauth",
+              label: "没有账号？注册并领取猫粮",
+              async authorize(_inputs, { signal } = {}) {
+                return startBrowserAuthorization(signal, { registration: true })
+              },
+            },
+          ]
+        : []),
       {
         // 手工兜底：授权服务不可用时，仍可分别填写 PAT 和 sk- 密钥。
         type: "api",
@@ -619,8 +663,10 @@ export const KunRouterPlugin = async (input) => {
 
 // 给测试用，别从入口导出别的函数：magpie 会把每个导出函数都当插件调用。
 export const _internal = {
+  INVITE_CODE,
   apiKeyOf,
   fetchSelf,
+  isAllowedAuthorizationURL,
   siteStatus,
   stableInstallationId,
   startBrowserAuthorization,

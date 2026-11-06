@@ -1,0 +1,72 @@
+name: 问题反馈
+description: 插件报错、授权失败、额度或签到不正常
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提问前先看一眼 README 的「命令与排查」一节：插件改过之后要在 Magpie 里把插件**关掉再打开**（或重跑 `magpie plugin add`），否则加载的还是旧缓存。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 一句话说清现象，比如「点浏览器授权没反应」「额度卡片一直是空的」。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 在 Magpie 里添加 KunRouter 插件
+        2. 点「浏览器授权（推荐）」
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望结果
+      description: 你觉得应该是什么样。
+  - type: input
+    id: plugin-version
+    attributes:
+      label: 插件版本
+      description: `package.json` 里的 version，或 `magpie plugin list` 里显示的版本。
+      placeholder: 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: magpie-version
+    attributes:
+      label: Magpie 版本
+      placeholder: 0.1.684
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 报错信息或日志
+      description: 有报错就把原文贴进来；没有可以留空。**贴之前删掉令牌、密钥和邮箱。**
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 已经试过的
+      options:
+        - label: 在 Magpie 里把插件关掉再打开（或重跑 magpie plugin add）
+        - label: 重新走了一次浏览器授权
+        - label: 确认用的是最新版本
+        - label: 确认贴出来的内容里没有令牌和密钥

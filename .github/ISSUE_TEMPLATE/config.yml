@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用文档
+    url: https://github.com/MY-Final/opencode-kunrouter-auth#readme
+    about: 安装、授权、选项框和排查方式都在 README 里
+  - name: KunRouter 站点
+    url: https://wcnmb.si
+    about: 账号、额度、令牌和分组都在站点后台

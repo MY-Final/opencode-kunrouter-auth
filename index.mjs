@@ -220,59 +220,65 @@ export const KunRouterPlugin = async () => ({
       }
     },
 
-    // 钱包是预付制：报剩余额度，不写 used/limit，magpie 会当余额窗口显示。
+    // 两个窗口：钱包余额（访问令牌读得到）+ 本期配额（对话响应里带的百分比）。
+    // 只有一把钥匙时只显示能读到的那一个，不假装知道另一边的数。
     async usage(getAuth) {
       const auth = await getAuth()
       if (auth?.type !== "api") return { windows: [] }
-      const key = tokenOf(auth)
-      if (!key) return { windows: [] }
-
-      const self = await fetchSelf(key)
-      if (self.error) {
-        // 只填了 sk- API 密钥的账号查不到钱包，但每次对话响应里带本期百分比，
-        // 有这条就先拿它顶着，免得额度卡片一片空白。
-        const seen = lastQuota.get(key)
-        if (seen) {
-          const resetHint = seen.resetAt
-            ? new Date(seen.resetAt * 1000).toLocaleString("zh-CN", { hour12: false })
-            : ""
-          return {
-            plan: "API 密钥",
-            windows: [
-              {
-                name: "本期配额",
-                ...(seen.resetAt ? { resetsAt: new Date(seen.resetAt * 1000).toISOString() } : {}),
-                display: `本期配额 ${seen.percent}%${resetHint ? ` · ${resetHint} 重置` : ""} · 钱包余额需访问令牌`,
-              },
-            ],
-          }
-        }
-        const out = { error: self.error, windows: [] }
-        if (self.expired) out.signIn = "expired"
-        return out
-      }
+      const token = tokenOf(auth)
+      const apiKey = apiKeyOf(auth)
+      if (!token && !apiKey) return { windows: [] }
 
       const status = await siteStatus()
       const unit = status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT
       const sym = status.symbol || "$"
-      const left = Number(self.user?.quota) || 0
-      const used = Number(self.user?.used_quota) || 0
-      const available = left / unit
-      const spent = used / unit
       const money = (n) => `$${n.toFixed(2)}`
+      const windows = []
+
+      // 本期配额：new-api 把 percent 和 reset_at 塞在每次对话响应里，
+      // 记在 sk- 密钥名下，所以拿 apiKeyOf 去查（不是访问令牌）。
+      const seen = lastQuota.get(apiKey || token)
+      if (seen) {
+        const resetHint = seen.resetAt
+          ? new Date(seen.resetAt * 1000).toLocaleString("zh-CN", { hour12: false })
+          : ""
+        windows.push({
+          name: "本期配额",
+          used: seen.percent,
+          ...(seen.resetAt ? { resetsAt: new Date(seen.resetAt * 1000).toISOString() } : {}),
+          // 这个百分比的准确定义还没核实（可能随时重置），先按只读处理：
+          // 显示出来，但不让路由拿它判断账号能不能用。
+          aside: true,
+          display: `已用 ${seen.percent}%${resetHint ? ` · ${resetHint} 重置` : ""}`,
+        })
+      }
+
+      // 只填了 sk- 的账号到这儿为止。
+      if (!token) return { plan: "API 密钥", windows }
+
+      const self = await fetchSelf(token)
+      if (self.error) {
+        const out = { windows }
+        if (self.expired) out.signIn = "expired"
+        if (!windows.length) out.error = self.error
+        return out
+      }
+
+      const left = Number(self.user?.quota) || 0
+      const spent = Number(self.user?.used_quota) || 0
+      const available = left / unit
+      windows.unshift({
+        name: "钱包",
+        balance: available,
+        unit: "USD",
+        display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent / unit)}`,
+      })
 
       return {
         plan: self.user?.group || "默认分组",
         user: self.user?.email || self.user?.username || undefined,
         balance: money(available),
-        windows: [
-          {
-            name: "钱包",
-            balance: available,
-            unit: "USD",
-            display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent)}`,
-          },
-        ],
+        windows,
       }
     },
 

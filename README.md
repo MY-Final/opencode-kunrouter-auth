@@ -21,7 +21,10 @@ KunRouter 的账号密码登录要过 Cloudflare Turnstile，脚本没法过；�
 
 ## 显示什么
 
-- **余额**：`/api/user/self` 的 `quota`，按站点 `/api/status` 的 `quota_per_unit`（默认 500000 = 1 美元）换算，币种符号跟站点一致。
+两个额度窗口，各管一边：
+
+- **钱包**：`/api/user/self` 的 `quota`，按站点 `/api/status` 的 `quota_per_unit`（默认 500000 = 1 美元）换算，币种符号跟站点一致。只有访问令牌读得到。
+- **本期配额**：new-api 在每次对话响应的 `usage.quota` 里塞了 `percent` 和 `reset_at`，插件顺手记下来，显示成「已用 38% · 某时重置」。只有 `sk-` 密钥也能看到这条。这个百分比的准确定义站点没文档，所以标成 `aside`：只看，不参与路由判断。
 - **签到**：站点开着 `checkin_enabled` 时，magpie 每北京日替每个账号签一次，结果写在用量卡片上。
 - **模型**：从 `/v1/models` 拉，拉不到就退回内置的三个占位模型。
 

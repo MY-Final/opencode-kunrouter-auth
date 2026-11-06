@@ -26,7 +26,7 @@ magpie plugin add ./opencode-kunrouter-auth
 
 ### 没有账号
 
-供应商登录页会多一个「没有账号？注册并领取猫粮」入口。点击后直接打开 KunRouter 注册页，插件已经自动填入 Magpie 专属邀请码：
+供应商登录页会多一个「没有账号？注册并领取鸡蛋」入口。点击后直接打开 KunRouter 注册页，插件已经自动填入 Magpie 专属邀请码：
 
 ```text
 shjglbwadfbhblqvwcpqoqbo

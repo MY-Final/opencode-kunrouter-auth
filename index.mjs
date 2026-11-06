@@ -435,7 +435,7 @@ export const KunRouterPlugin = async (input) => {
         ? [
             {
               type: "oauth",
-              label: "没有账号？注册并领取猫粮",
+              label: "没有账号？注册并领取鸡蛋",
               async authorize(_inputs, { signal } = {}) {
                 return startBrowserAuthorization(signal, { registration: true })
               },

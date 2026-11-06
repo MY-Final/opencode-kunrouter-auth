@@ -1,6 +1,6 @@
 # opencode-kunrouter-auth
 
-KunRouter（[wcnmb.si](https://wcnmb.si)）的 magpie / OpenCode 供应商插件：访问令牌登录、钱包余额、每日签到。
+KunRouter（[wcnmb.si](https://wcnmb.si)）的 magpie / OpenCode 供应商插件：浏览器一键授权、钱包余额、每日签到。
 
 ## 装
 
@@ -11,13 +11,23 @@ magpie plugin add ./opencode-kunrouter-auth
 
 或者直接 `magpie plugin add https://github.com/dian-dian233/opencode-kunrouter-auth`。
 
-## 登录：只能用访问令牌
+## 登录：浏览器一键授权
 
-KunRouter 的账号密码登录要过 Cloudflare Turnstile，脚本没法过；把密码交给插件也不是个好主意。所以插件只认后台生成的令牌：
+在 magpie 里选择「浏览器授权（推荐）」后，magpie 会打开 KunRouter 授权页：
 
-后台 →「设置」→「访问令牌」→ 生成 → 复制，粘进 magpie 的登录框。
+1. 登录 KunRouter。
+2. 选择一个模型分组；插件拿到的 `sk-` 密钥只会使用这个分组。
+3. 确认 Magpie 的授权范围并完成安全验证。
+4. 浏览器自动跳回本机一次性回调，magpie 接收访问令牌和模型密钥。
 
-登录时插件会拿这个令牌请求一次 `/api/user/self`，令牌不对当场报错，不会存进来。
+插件不会拿到账号密码。授权页使用 PKCE、随机 `state` 和本机 loopback 回调；令牌不会放进浏览器跳转 URL。每次重新授权都会轮换旧的 Magpie 凭据。
+
+模型分组可以在每次浏览器授权时重新选择。重新授权会同时更换密钥和分组，不需要手动删除旧 Key。
+
+如果浏览器授权暂时不可用，仍可选择「手动填写访问令牌 + API 密钥」作为兜底：
+
+- 访问令牌：后台 →「个人设置」→「安全设置」→ 访问令牌。
+- API 密钥：后台 →「令牌」→ 新建，复制 `sk-` 开头的密钥。
 
 ## 选项框
 
@@ -34,11 +44,11 @@ KunRouter 的账号密码登录要过 Cloudflare Turnstile，脚本没法过；�
 
 两个额度窗口，各管一边：
 
-- **钱包**：`/api/user/self` 的 `quota`，按站点 `/api/status` 的 `quota_per_unit`（默认 500000 = 1 美元）换算，币种符号跟站点一致。只有访问令牌读得到。
+- **钱包**：`/api/user/self` 的 `quota`，按站点 `/api/status` 的 `quota_per_unit`（默认 500000 = 1 美元）换算，币种符号跟站点一致。浏览器授权后直接可用。
 - **本期配额**：new-api 在每次对话响应的 `usage.quota` 里塞了 `percent` 和 `reset_at`，插件顺手记下来，显示成「已用 38% · 某时重置」。只有 `sk-` 密钥也能看到这条。这个百分比的准确定义站点没文档，所以标成 `aside`：只看，不参与路由判断。
 - **说明**：钱包那一栏下面跟一行小字，写清楚余额从哪来、按什么比例换算、本期配额为什么只是个百分比。
 - **签到**：站点开着 `checkin_enabled` 时，magpie 每北京日替每个账号签一次，结果写在用量卡片上。
-- **模型**：从 `/v1/models` 拉，拉不到就退回内置的三个占位模型。
+- **模型**：从 `/v1/models` 拉，按授权时选择的模型分组返回；拉不到就退回内置的三个占位模型。
 
 ## 域名为什么是两个
 
@@ -47,8 +57,21 @@ KunRouter 的账号密码登录要过 Cloudflare Turnstile，脚本没法过；�
 
 直连域名如果哪天不通，把 `index.mjs` 里的 `API` 改成 `https://wcnmb.si` 即可，代价是长请求容易被 CF 掐断。
 
+## 本地联调
+
+插件默认连正式站。需要连本地服务时，对加载插件的 magpie 命令临时覆盖两个地址：
+
+```sh
+KUNROUTER_SITE=http://localhost:3000 \
+KUNROUTER_API=http://localhost:3000 \
+magpie plugin login kunrouter
+```
+
+本地后端要把 `ServerAddress` 设成同一个 `http://localhost:3000`，否则授权回调会回到正式域名。`magpie quota kunrouter` 也要带同样的环境变量，才会读取本地钱包。
+
 ## 已知边界
 
 - 只有单一 provider id `kunrouter`，多账号靠 magpie 自己的 `id#xxxxxx` 机制。
+- 浏览器授权签发的访问令牌和模型密钥默认 30 天有效；重新授权会轮换两把凭据，并可按新的分组重新签发。
 - 令牌失效时 `usage` 会带 `signIn: "expired"`，magpie 会把账号标出来让你重登。
 - 模型的能力参数（上下文长度、是否支持 tool call）拿不到真实值，统一按 128k / 8k / 支持工具调用填，站点要是给了新模型自己改 `baseModel`。

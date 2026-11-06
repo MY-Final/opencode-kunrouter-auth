@@ -1,13 +1,21 @@
 // KunRouter (wcnmb.si) provider plugin for OpenCode / magpie.
 //
-// KunRouter 跑的是 new-api（one-api 的分支）。它的账号密码登录要走 Cloudflare
-// Turnstile，脚本过不去，所以插件只认后台生成的「访问令牌」（Bearer）。
+// KunRouter 跑的是 new-api（one-api 的分支）。账号密码登录走浏览器授权，
+// 访问令牌留在 metadata，模型请求使用站点为该插件单独签发的 sk- 密钥。
 // 余额和签到走站点侧的 /api，模型请求走直连域名，绕开 Cloudflare 的 100 秒上限。
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import { createServer } from "node:http"
+import { homedir, hostname } from "node:os"
+
 const PROVIDER = "kunrouter"
-const SITE = "https://wcnmb.si" // 控制台 + /api
-const API = "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.1.0"
+const SITE =
+  process.env.KUNROUTER_SITE?.replace(/\/+$/, "") || "https://wcnmb.si" // 控制台 + /api
+const API =
+  process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
+  "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
+const VERSION = "0.3.0"
+const MAGPIE_CLIENT_ID = "magpie"
 
 // new-api 的默认换算：500000 quota = 1 美元，站点 /api/status 会覆盖。
 const DEFAULT_QUOTA_PER_UNIT = 500000
@@ -72,17 +80,238 @@ function authHeaders(key) {
 }
 
 function tokenOf(auth) {
-  return typeof auth?.key === "string" ? auth.key.trim() : ""
+  const fromMeta =
+    typeof auth?.metadata?.accessToken === "string"
+      ? auth.metadata.accessToken.trim()
+      : ""
+  if (fromMeta) return fromMeta
+  const key = typeof auth?.key === "string" ? auth.key.trim() : ""
+  return key && !key.startsWith("sk-") ? key : ""
 }
 
 // new-api 有两套凭据：访问令牌只能读 /api（余额、签到），sk- 密钥只能调 /v1。
-// 登录时两样都收，访问令牌当主 key 存，sk- 放 metadata 里给模型请求用。
+// 浏览器授权会把访问令牌放 metadata，把 sk- 密钥放主 key；手工登录也兼容。
 function apiKeyOf(auth) {
   const meta = auth?.metadata
   const fromMeta = typeof meta?.apiKey === "string" ? meta.apiKey.trim() : ""
   if (fromMeta) return fromMeta
-  const key = tokenOf(auth)
+  const key = typeof auth?.key === "string" ? auth.key.trim() : ""
   return key.startsWith("sk-") ? key : ""
+}
+
+function authorizationError(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  return {
+    type: "failed",
+    error: (message || "KunRouter 浏览器授权失败").slice(0, 480),
+  }
+}
+
+function randomURIToken() {
+  return randomBytes(32).toString("base64url")
+}
+
+function stableInstallationId() {
+  const digest = createHash("sha256")
+    .update(`kunrouter-magpie-v1\0${hostname()}\0${homedir()}`)
+    .digest()
+    .subarray(0, 16)
+  digest[6] = (digest[6] & 0x0f) | 0x50
+  digest[8] = (digest[8] & 0x3f) | 0x80
+  const hex = digest.toString("hex")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function deviceName() {
+  return (hostname() || "Magpie").slice(0, 32)
+}
+
+function sameSecret(left, right) {
+  if (typeof left !== "string" || typeof right !== "string") return false
+  const a = Buffer.from(left)
+  const b = Buffer.from(right)
+  return a.length === b.length && timingSafeEqual(a, b)
+}
+
+async function responseJSON(res) {
+  const body = await res.json().catch(() => null)
+  if (!res.ok || body?.success !== true) {
+    const message =
+      typeof body?.message === "string" && body.message
+        ? body.message
+        : `KunRouter 返回 ${res.status}`
+    throw new Error(message)
+  }
+  return body.data
+}
+
+function listenLoopback(server) {
+  return new Promise((resolve, reject) => {
+    const onError = (error) => reject(error)
+    server.once("error", onError)
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", onError)
+      const address = server.address()
+      if (!address || typeof address === "string") {
+        reject(new Error("无法分配本地回调端口"))
+        return
+      }
+      resolve(address.port)
+    })
+  })
+}
+
+function waitForLoopbackCallback(server, expectedState, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener("abort", onAbort)
+      fn(value)
+    }
+    const onAbort = () => finish(reject, new Error("浏览器授权已取消"))
+    if (signal?.aborted) {
+      reject(new Error("浏览器授权已取消"))
+      return
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    server.on("request", (req, res) => {
+      if (settled) {
+        res.writeHead(409, { "content-type": "text/plain; charset=utf-8" })
+        res.end("授权请求已处理")
+        return
+      }
+      let callback
+      let code
+      try {
+        callback = new URL(req.url || "/", "http://127.0.0.1")
+        if (
+          callback.protocol !== "http:" ||
+          callback.hostname !== "127.0.0.1" ||
+          callback.pathname !== "/callback"
+        ) {
+          throw new Error("本地回调路径无效")
+        }
+        if (!sameSecret(callback.searchParams.get("state"), expectedState)) {
+          throw new Error("授权状态校验失败")
+        }
+        code = callback.searchParams.get("code")
+        const denied = callback.searchParams.get("error")
+        if (!denied && !code) throw new Error("KunRouter 没有返回授权码")
+        settled = true
+        signal?.removeEventListener("abort", onAbort)
+        if (denied) {
+          res.writeHead(400, { "content-type": "text/plain; charset=utf-8" })
+          res.end("KunRouter 授权未完成，请返回 Magpie。")
+          reject(new Error(denied === "access_denied" ? "已取消 KunRouter 授权" : "KunRouter 拒绝了授权"))
+          return
+        }
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" })
+        res.end(
+          "<!doctype html><meta charset=\"utf-8\"><title>KunRouter</title>" +
+            "<body style=\"font-family:system-ui,sans-serif;padding:2rem\">" +
+            "<h1>授权完成</h1><p>可以关闭此页面并返回 Magpie。</p></body>",
+        )
+        resolve(code)
+      } catch (error) {
+        res.writeHead(400, { "content-type": "text/plain; charset=utf-8" })
+        res.end("KunRouter 授权回调无效。")
+        if (settled) reject(error)
+      }
+    })
+  })
+}
+
+async function startBrowserAuthorization(signal) {
+  const server = createServer()
+  try {
+    const port = await listenLoopback(server)
+    const redirectURI = `http://127.0.0.1:${port}/callback`
+    const state = randomURIToken()
+    const verifier = randomURIToken()
+    const challenge = createHash("sha256").update(verifier).digest("base64url")
+    const res = await fetch(`${SITE}/api/desktop/auth/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...clientHeaders() },
+      body: JSON.stringify({
+        client_id: MAGPIE_CLIENT_ID,
+        installation_id: stableInstallationId(),
+        device_name: deviceName(),
+        redirect_uri: redirectURI,
+        state,
+        code_challenge: challenge,
+        code_challenge_method: "S256",
+      }),
+      signal,
+    })
+    const started = await responseJSON(res)
+    const authorizationURL = new URL(String(started?.authorization_url || ""))
+    if (
+      !["https:", "http:"].includes(authorizationURL.protocol) ||
+      authorizationURL.origin !== new URL(SITE).origin
+    ) {
+      throw new Error("KunRouter 返回了无效的授权地址")
+    }
+    const callbackPromise = waitForLoopbackCallback(server, state, signal)
+    const closeOnAbort = () => server.close()
+    signal?.addEventListener("abort", closeOnAbort, { once: true })
+    callbackPromise.catch(() => {})
+    return {
+      url: authorizationURL.toString(),
+      instructions: "请在浏览器中登录 KunRouter 并确认授权；完成后 Magpie 会自动继续。",
+      method: "auto",
+      async callback() {
+        try {
+          const code = await callbackPromise
+          const exchange = await fetch(`${SITE}/api/desktop/auth/exchange`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...clientHeaders() },
+            body: JSON.stringify({
+              code,
+              code_verifier: verifier,
+              redirect_uri: redirectURI,
+            }),
+            signal,
+          })
+          const data = await responseJSON(exchange)
+          const accessToken = String(data?.access_token || "").trim()
+          const apiKey = String(data?.api_key || "").trim()
+          const group = String(data?.group || "").trim()
+          if (!accessToken || !apiKey.startsWith("sk-")) {
+            throw new Error("KunRouter 返回的凭据不完整")
+          }
+          const username =
+            data?.user?.email ||
+            data?.user?.username ||
+            data?.user?.display_name ||
+            undefined
+          return {
+            type: "success",
+            key: apiKey,
+            accountId:
+              data?.user?.id != null ? String(data.user.id) : undefined,
+            metadata: {
+              accessToken,
+              apiKey,
+              mode: "browser",
+              username,
+              group: group || undefined,
+              expiresAt: Number(data?.expires_at) || undefined,
+            },
+          }
+        } catch (error) {
+          return authorizationError(error)
+        } finally {
+          signal?.removeEventListener("abort", closeOnAbort)
+          server.close()
+        }
+      },
+    }
+  } catch (error) {
+    server.close()
+    return authorizationError(error)
+  }
 }
 
 // /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
@@ -163,10 +392,16 @@ export const KunRouterPlugin = async (input) => {
     ],
     methods: [
       {
-        // 唯一可行的自动化登录：后台「设置 → 访问令牌」生成的 PAT。
-        // 密码登录要过 Turnstile，插件里做不了，也不该要用户把密码交出来。
+        type: "oauth",
+        label: "浏览器授权（推荐）",
+        async authorize(_inputs, { signal } = {}) {
+          return startBrowserAuthorization(signal)
+        },
+      },
+      {
+        // 手工兜底：授权服务不可用时，仍可分别填写 PAT 和 sk- 密钥。
         type: "api",
-        label: "访问令牌 + API 密钥",
+        label: "手动填写访问令牌 + API 密钥",
         placeholder: "两把钥匙分别粘贴",
         prompts: [
           {
@@ -257,7 +492,7 @@ export const KunRouterPlugin = async (input) => {
       const status = await siteStatus()
       const unit = status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT
       const sym = status.symbol || "$"
-      const money = (n) => `$${n.toFixed(2)}`
+      const money = (n) => `${sym} ${n.toFixed(2)}`
       const windows = []
 
       // 本期配额：new-api 把 percent 和 reset_at 塞在每次对话响应里，
@@ -307,7 +542,7 @@ export const KunRouterPlugin = async (input) => {
       })
 
       return {
-        plan: self.user?.group || "默认分组",
+        plan: auth.metadata?.group || self.user?.group || "默认分组",
         user: self.user?.email || self.user?.username || undefined,
         balance: money(available),
         windows,
@@ -383,4 +618,13 @@ export const KunRouterPlugin = async (input) => {
 }
 
 // 给测试用，别从入口导出别的函数：magpie 会把每个导出函数都当插件调用。
-export const _internal = { fetchSelf, siteStatus, DEFAULT_MODELS, DEFAULT_QUOTA_PER_UNIT }
+export const _internal = {
+  apiKeyOf,
+  fetchSelf,
+  siteStatus,
+  stableInstallationId,
+  startBrowserAuthorization,
+  tokenOf,
+  DEFAULT_MODELS,
+  DEFAULT_QUOTA_PER_UNIT,
+}

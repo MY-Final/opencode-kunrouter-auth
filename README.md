@@ -5,11 +5,11 @@ KunRouter（[wcnmb.si](https://wcnmb.si)）的 magpie / OpenCode 供应商插件
 ## 装
 
 ```sh
-git clone https://github.com/dian-dian233/opencode-kunrouter-auth.git
+git clone https://github.com/MY-Final/opencode-kunrouter-auth.git
 magpie plugin add ./opencode-kunrouter-auth
 ```
 
-或者直接 `magpie plugin add https://github.com/dian-dian233/opencode-kunrouter-auth`。
+或者直接 `magpie plugin add https://github.com/MY-Final/opencode-kunrouter-auth`。
 
 ## 登录：浏览器一键授权
 

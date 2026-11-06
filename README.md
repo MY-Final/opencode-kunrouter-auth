@@ -1,6 +1,8 @@
 # opencode-kunrouter-auth
 
-KunRouter（[wcnmb.si](https://wcnmb.si)）的 magpie / OpenCode 供应商插件：浏览器一键授权、钱包余额、每日签到。
+[KunRouter](https://wcnmb.si) 的 **Magpie 插件**（同时兼容 OpenCode）：浏览器一键授权、钱包余额、每日签到。
+
+> 维护者：[MY-Final](https://github.com/MY-Final) · 插件名：KunRouter · 适用：Magpie / OpenCode
 
 ## 装
 

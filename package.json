@@ -10,7 +10,7 @@
   "files": ["index.mjs", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "kunrouter", "new-api"],
   "license": "MIT",
-  "repository": "github:dian-dian233/opencode-kunrouter-auth",
+  "repository": "github:MY-Final/opencode-kunrouter-auth",
   "magpie": {
     "name": "KunRouter",
     "icon": "https://wcnmb.si/logo.png",

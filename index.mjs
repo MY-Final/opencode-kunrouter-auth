@@ -14,7 +14,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.4.0"
+const VERSION = "0.5.0"
 const MAGPIE_CLIENT_ID = "magpie"
 const INVITE_CODE = "shjglbwadfbhblqvwcpqoqbo"
 const AUTHORIZATION_ORIGIN =
@@ -379,6 +379,56 @@ async function fetchSelf(key) {
   return { user: body.data }
 }
 
+// 用户在控制台删掉 Key 后，插件手里的 sk- 立刻失效，但访问令牌还在。
+// 用访问令牌重签一把同名 Key，再把新凭据写回 Magpie，下一次请求就能接着用。
+const RECOVERY_COOLDOWN_MS = 60 * 1000
+const recoveryAttempts = new Map() // 访问令牌 -> { at, promise }
+
+async function recoverApiKey(accessToken, group) {
+  if (!accessToken) return null
+  const cached = recoveryAttempts.get(accessToken)
+  if (cached && Date.now() - cached.at < RECOVERY_COOLDOWN_MS) {
+    return cached.promise.catch(() => null)
+  }
+  const promise = (async () => {
+    const res = await fetch(`${SITE}/api/desktop/keys`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...authHeaders(accessToken) },
+      // group 为空时站点按账号默认分组签发，和首次授权一致。
+      body: JSON.stringify({ name: "Magpie", group: group || undefined }),
+      signal: AbortSignal.timeout(10000),
+    })
+    const data = await responseJSON(res)
+    const key = typeof data?.key === "string" ? data.key.trim() : ""
+    if (!key.startsWith("sk-")) return null
+    return { key, group: String(data?.group || ""), id: data?.id }
+  })()
+  recoveryAttempts.set(accessToken, { at: Date.now(), promise })
+  return promise.catch(() => null)
+}
+
+// 把新 Key 写回 Magpie 的账号；写不进去也只是一次性生效，不影响这次请求。
+async function saveRecoveredAuth(client, auth, recovered) {
+  if (!client?.auth?.set) return
+  const metadata = { ...(auth?.metadata ?? {}) }
+  metadata.apiKey = recovered.key
+  if (recovered.group) metadata.group = recovered.group
+  if (recovered.id != null) metadata.apiKeyId = recovered.id
+  try {
+    await client.auth.set({
+      path: { id: PROVIDER },
+      body: {
+        type: "api",
+        key: recovered.key,
+        accountId: auth?.accountId,
+        metadata,
+      },
+    })
+  } catch {
+    /* 写回失败就等下一次 401 再试 */
+  }
+}
+
 export const KunRouterPlugin = async (input) => {
   // magpie 的选项框：plugins.json 里这一项的 options，按供应商 id 读。
   const opt = (key, fallback) => {
@@ -497,14 +547,34 @@ export const KunRouterPlugin = async (input) => {
     async loader(getAuth) {
       const auth = await getAuth()
       if (auth?.type !== "api") return {}
-      const key = apiKeyOf(auth) || tokenOf(auth)
+      const client = input?.client
+      let key = apiKeyOf(auth) || tokenOf(auth)
+      const usedApiKey = Boolean(apiKeyOf(auth))
       return {
         baseURL: `${apiBase()}/v1`,
         async fetch(input, init) {
-          const headers = new Headers(init?.headers)
-          headers.set("authorization", `Bearer ${key}`)
-          for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
-          const res = await fetch(input, { ...init, headers })
+          const send = (secret) => {
+            const headers = new Headers(init?.headers)
+            headers.set("authorization", `Bearer ${secret}`)
+            for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
+            return fetch(input, { ...init, headers })
+          }
+          let res = await send(key)
+          // Key 被控制台删掉后 /v1 会直接 401。访问令牌还能用就重签一把再试。
+          if (res.status === 401 && usedApiKey) {
+            const recovered = await recoverApiKey(tokenOf(auth), auth?.metadata?.group)
+            if (recovered?.key) {
+              key = recovered.key
+              await saveRecoveredAuth(client, auth, recovered)
+              // 请求体已经被读掉（流式上传）时没法重放，留给下一次请求。
+              const replayable =
+                init?.body == null ||
+                typeof init.body === "string" ||
+                init.body instanceof Uint8Array ||
+                init.body instanceof ArrayBuffer
+              if (replayable) res = await send(key)
+            }
+          }
           // 顺手记一下额度：new-api 把本期百分比放在 usage.quota 里，
           // 只解析 JSON 响应，流式的不碰，失败就算了。
           try {
@@ -667,6 +737,7 @@ export const _internal = {
   apiKeyOf,
   fetchSelf,
   isAllowedAuthorizationURL,
+  recoverApiKey,
   siteStatus,
   stableInstallationId,
   startBrowserAuthorization,

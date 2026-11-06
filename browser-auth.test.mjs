@@ -125,5 +125,25 @@ assert.equal(
   "sk-browser_api_key",
 )
 
+// 控制台删掉 Key 后，用访问令牌重签一把，并把分组带上。
+let keyCreateBody
+globalThis.fetch = async (url, init = {}) => {
+  if (String(url).endsWith("/api/desktop/keys")) {
+    keyCreateBody = JSON.parse(String(init.body))
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { id: 88, name: "Magpie", key: "sk-recovered_key", group: "vip", models: [] },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+const recovered = await _internal.recoverApiKey("nap_browser_access", "vip")
+assert.deepEqual(recovered, { key: "sk-recovered_key", group: "vip", id: 88 })
+assert.deepEqual(keyCreateBody, { name: "Magpie", group: "vip" })
+assert.equal(await _internal.recoverApiKey("", "vip"), null)
+
 globalThis.fetch = realFetch
 console.log("browser authorization tests passed")

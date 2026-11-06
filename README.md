@@ -17,7 +17,7 @@ magpie plugin add ./opencode-kunrouter-auth
 
 - **浏览器授权（推荐）**：打开 KunRouter 授权页，登录、选分组、确认授权，浏览器自动跳回本机一次性回调。插件拿不到账号密码，用 PKCE + 随机 `state` + loopback 回调，令牌不进跳转 URL。
 - **没有账号**：登录页的「注册并领取鸡蛋」入口会打开注册页并自动填入活动邀请码。邀请码不可用（禁用 / 过期 / 名额满）时入口自动隐藏；换活动用环境变量 `KUNROUTER_INVITE_CODE` 覆盖，不用改代码发版。
-- **手动填写访问令牌 + API 密钥**：授权服务不可用时的兜底。访问令牌读余额和签到，`sk-` 密钥请求模型；只填访问令牌也能登录，但**不能调用模型**（会直接提示补一把 `sk-`）。
+- **手动填写 / 更换访问令牌 + API 密钥**：授权服务不可用时的兜底，也是换 Key 的入口。访问令牌读余额和签到，`sk-` 密钥请求模型；只填访问令牌也能登录，但**不能调用模型**（会直接提示补一把 `sk-`）。
 
 访问令牌：后台「个人设置 → 安全设置」；API 密钥：后台「令牌」新建，`sk-` 开头。
 
@@ -27,14 +27,13 @@ magpie plugin add ./opencode-kunrouter-auth
 
 ### 想换一把 Key？
 
-插件页面只能整组账号替换，没有单独改 Key 的输入框。直接重新登录不会覆盖，会多出一个 `kunrouter#xxxxxx` 账号，所以要先登出再登录：
+插件页打开 KunRouter，点「重新登录」，选「手动填写 / 更换访问令牌 + API 密钥」，把两把钥匙粘贴进去即可。重新登录会覆盖原来那条记录，不会多出 `kunrouter#xxxxxx` 账号，也不用先登出。
 
 ```sh
-magpie plugin logout kunrouter
 magpie plugin login kunrouter
 ```
 
-只想换 `sk-` 不换账号：在控制台删掉旧 Key，等插件 401 后自动重签。
+只想换 `sk-`、不想再填访问令牌：在控制台删掉旧 Key，下次请求 401 时插件会自动重签一把同名 Key 并写回 Magpie。
 
 ## 选项
 
@@ -76,7 +75,7 @@ magpie plugin login kunrouter
 
 ## 已知边界
 
-- 只有单一 provider id `kunrouter`，多账号靠 magpie 的 `id#xxxxxx` 机制。
+- 只有单一 provider id `kunrouter`，一台机器保留一个账号；重新登录会覆盖它。
 - 浏览器授权签发的凭据默认 30 天有效，重新授权会轮换两把凭据并按新分组重签。
 - 令牌失效时 `usage` 带 `signIn: "expired"`，magpie 会标出来让你重登。
 - 模型能力参数拿不到真实值，统一按 128k 上下文 / 8k 输出 / 支持工具调用填。

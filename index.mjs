@@ -14,7 +14,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.6.0"
+const VERSION = "0.7.0"
 const MAGPIE_CLIENT_ID = "magpie"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
 const INVITE_CODE = (
@@ -603,6 +603,10 @@ export const KunRouterPlugin = async (input) => {
 
   auth: {
     provider: PROVIDER,
+    // 一台机器只留一个账号：重新登录（包括手动填 Key）覆盖原来那条，
+    // 而不是另开一个 kunrouter#xxxxxx。验证码/密钥填错想重来，
+    // 直接再走一遍登录即可，不用先登出。
+    single: true,
     maxConcurrency: 8,
     options: [
       {
@@ -649,7 +653,9 @@ export const KunRouterPlugin = async (input) => {
       {
         // 手工兜底：授权服务不可用时，仍可分别填写 PAT 和 sk- 密钥。
         type: "api",
-        label: "手动填写访问令牌 + API 密钥",
+        // 插件自己收两把钥匙；关掉 magpie 额外的 API key 输入框，免得重复粘贴。
+        keyless: true,
+        label: "手动填写 / 更换访问令牌 + API 密钥",
         placeholder: "两把钥匙分别粘贴",
         prompts: [
           {

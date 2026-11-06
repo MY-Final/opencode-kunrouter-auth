@@ -24,6 +24,16 @@ magpie plugin add ./opencode-kunrouter-auth
 
 模型分组可以在每次浏览器授权时重新选择。重新授权会同时更换密钥和分组，不需要手动删除旧 Key。
 
+### 没有账号
+
+供应商登录页会多一个「没有账号？注册并领取鸡蛋」入口。点击后直接打开 KunRouter 注册页，插件已经自动填入 Magpie 专属邀请码：
+
+```text
+shjglbwadfbhblqvwcpqoqbo
+```
+
+用户不需要手动输入邀请码。注册并登录后会自动返回 Magpie 授权页，选择分组并完成授权；邀请码对应的分组和注册额度由 KunRouter 后台控制。邀请码写在 `index.mjs` 的 `INVITE_CODE` 常量里，留空时不展示这个入口。
+
 如果浏览器授权暂时不可用，仍可选择「手动填写访问令牌 + API 密钥」作为兜底：
 
 - 访问令牌：后台 →「个人设置」→「安全设置」→ 访问令牌。
@@ -53,9 +63,12 @@ magpie plugin add ./opencode-kunrouter-auth
 ## 域名为什么是两个
 
 - `https://wcnmb.si/api` —— 控制台和管理接口（`/api/status`、`/api/user/self`、`/api/user/checkin`）
+- `https://kuncode.120403.xyz/desktop/authorize` —— 浏览器授权页，由站点 `/api/desktop/auth/start` 返回
 - `https://direct.wcnmb.fun/v1` —— 直连 API，实际模型请求走这里，绕开 Cloudflare 的 100 秒上限
 
 直连域名如果哪天不通，把 `index.mjs` 里的 `API` 改成 `https://wcnmb.si` 即可，代价是长请求容易被 CF 掐断。
+
+授权域名和 API 域名分开部署时，插件接受 `wcnmb.si`、`wcnmb.fun`、`kuncode.120403.xyz` 及其子域，也接受 `KUNROUTER_AUTH_ORIGIN` 指定的域名，避免把授权码发送到任意地址。
 
 ## 本地联调
 

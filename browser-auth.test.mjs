@@ -49,6 +49,26 @@ assert.match(
   startBody.installation_id,
   /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
 )
+for (const url of [
+  "https://wcnmb.si/desktop/authorize?flow=test",
+  "https://wcnmb.fun/desktop/authorize?flow=test",
+  "https://direct.wcnmb.fun/desktop/authorize?flow=test",
+  "https://kuncode.120403.xyz/desktop/authorize?flow=test",
+]) {
+  assert.equal(_internal.isAllowedAuthorizationURL(url), true)
+}
+assert.equal(
+  _internal.isAllowedAuthorizationURL(
+    "https://attacker.example/desktop/authorize?flow=test",
+  ),
+  false,
+)
+assert.equal(
+  _internal.isAllowedAuthorizationURL(
+    "https://wcnmb.fun.attacker.example/desktop/authorize?flow=test",
+  ),
+  false,
+)
 
 const callbackBase = new URL(startBody.redirect_uri)
 const badState = new URL(callbackBase)
@@ -69,6 +89,20 @@ assert.equal(result.metadata.accessToken, "nap_browser_access")
 assert.equal(result.metadata.group, "vip")
 assert.equal(exchangeBody.code, "one-time-code")
 assert.equal(exchangeBody.redirect_uri, startBody.redirect_uri)
+
+const registrationController = new AbortController()
+const registration = await _internal.startBrowserAuthorization(
+  registrationController.signal,
+  { registration: true },
+)
+const registrationURL = new URL(registration.url)
+assert.equal(registrationURL.searchParams.get("mode"), "register")
+assert.equal(
+  registrationURL.searchParams.get("invite_code"),
+  _internal.INVITE_CODE,
+)
+registrationController.abort()
+assert.equal((await registration.callback()).type, "failed")
 
 const controller = new AbortController()
 const cancelled = await _internal.startBrowserAuthorization(controller.signal)

@@ -1,6 +1,6 @@
 # opencode-kunrouter-auth
 
-[KunRouter](https://wcnmb.si) 的 **Magpie 插件**（同时兼容 OpenCode）：浏览器一键授权、钱包余额、每日签到。
+[KunRouter](https://wcnmb.si) 的 **Magpie 插件**（同时兼容 OpenCode）：浏览器一键授权、钱包与订阅额度、每日签到。
 
 > 维护者：[MY-Final](https://github.com/MY-Final) · 插件名：KunRouter · 适用：Magpie / OpenCode
 
@@ -40,7 +40,7 @@ magpie plugin login kunrouter
 | 选项 | 默认 | 干什么 |
 | --- | --- | --- |
 | `direct_api` | 开 | 模型请求走 `direct.wcnmb.fun`，绕开 Cloudflare 的 100 秒上限；关掉走 `wcnmb.si/v1` |
-| `period_window` | 开 | 额度卡多显示一栏「本期配额」；关掉只看钱包 |
+| `period_window` | 开 | 显示订阅剩余额度和滚动窗口；关掉只看钱包 |
 | `registration_entry` | 开 | 登录页显示注册入口；邀请码不可用时自动隐藏，关掉完全不提注册 |
 
 改完选项要重载插件，`config` 里的供应商地址才会跟着变。
@@ -48,7 +48,8 @@ magpie plugin login kunrouter
 ## 显示什么
 
 - **钱包**：`/api/user/self` 的 `quota`，按 `/api/status` 的 `quota_per_unit` 换算，单位跟随站点币种（本站 🥚）。
-- **本期配额**：对话响应里的 `usage.quota`，流式（SSE）和非流式都解析，标成只读 `aside`。
+- **订阅额度**：`/api/subscription/self` 里的套餐总额、已用、剩余和到期时间；Lite 等套餐的日/周/月滚动窗口也会分别显示。
+- **计费优先级**：非默认优先级会跟在顶部套餐名后，不再单独占一行。
 - **分组**：读 `/api/desktop/keys` 按 Key 遮罩匹配真实分组，读不到才退回授权时快照。
 - **签到**：站点开着 `checkin_enabled` 时每日自动签到。
 - **模型**：从 `/v1/models` 拉，拉不到退回内置占位模型。

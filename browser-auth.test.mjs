@@ -236,24 +236,121 @@ globalThis.fetch = async (url) => {
       { status: 200, headers: { "content-type": "application/json" } },
     )
   }
+  if (u.endsWith("/api/subscription/self")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          billing_preference: "subscription_first",
+          subscriptions: [
+            {
+              subscription: {
+                id: 9,
+                user_id: 1,
+                plan_id: 3,
+                status: "active",
+                start_time: 1760000000,
+                end_time: 1762592000,
+                amount_total: 15000000,
+                amount_used: 4500000,
+                allow_wallet_overflow: true,
+                quota_windows: [
+                  {
+                    window_seconds: 86400,
+                    quota_limit: 500000,
+                    used: 125000,
+                    remaining: 375000,
+                    next_release_at: 1761000000,
+                    sort_order: 0,
+                  },
+                ],
+              },
+            },
+          ],
+          all_subscriptions: [],
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.endsWith("/api/subscription/plans")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: [{ plan: { id: 3, title: "Coding 月卡" } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
   throw new Error(`unexpected fetch: ${url}`)
 }
-const sse = new Response(
-  'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
-    'data: {"usage":{"quota":{"percent":42,"reset_at":2000000000}}}\n\n' +
-    "data: [DONE]\n",
-  { status: 200, headers: { "content-type": "text/event-stream" } },
-)
-await _internal.captureQuota(sse, "sk-ssekey")
 const usageHooks = await KunRouterPlugin({})
 const usage = await usageHooks.auth.usage(async () => ({
   type: "api",
   key: "sk-ssekey",
   metadata: { apiKey: "sk-ssekey", accessToken: "nap_x" },
 }))
-assert.equal(usage.windows.find((w) => w.name === "本期配额")?.used, 42)
 assert.equal(usage.windows.find((w) => w.name === "钱包")?.unit, "🥚")
-assert.equal(usage.plan, "免费鸡蛋")
+const subscription = usage.windows.find((w) => w.name === "Coding 月卡")
+assert.equal(subscription?.limit, 30)
+assert.equal(subscription?.amount, 9)
+assert.equal(subscription?.balance, 21)
+assert.equal(subscription?.unit, "🥚")
+assert.match(subscription?.display || "", /剩余 🥚 21\.00/)
+assert.equal(usage.plan, "Coding 月卡 · 免费鸡蛋")
+assert.ok(usage.until)
+const daily = usage.windows.find((w) => w.name === "日额度")
+assert.equal(daily?.limit, 1)
+assert.equal(daily?.amount, 0.25)
+assert.equal(daily?.balance, 0.75)
+assert.equal(daily?.span, 86400)
+assert.ok(daily?.resetsAt)
+assert.equal(daily?.aside, true)
+assert.equal(usage.windows.some((w) => w.name === "账号"), false)
+assert.equal(usage.windows.some((w) => w.name === "说明"), false)
+assert.equal(usage.windows.some((w) => w.name === "本期配额"), false)
+
+// 老服务端没有给 Magpie 开放订阅读取时，钱包照常显示，不能误判成登录过期。
+globalThis.fetch = async (url) => {
+  const u = String(url)
+  if (u.endsWith("/api/status")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { quota_per_unit: 500000, custom_currency_symbol: "🥚" },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.includes("/api/desktop/keys")) {
+    return new Response(JSON.stringify({ success: false }), { status: 403 })
+  }
+  if (u.endsWith("/api/user/self")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { id: 1, username: "u", group: "免费鸡蛋", quota: 500000, used_quota: 250000 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.includes("/api/subscription/")) {
+    return new Response(JSON.stringify({ success: false }), { status: 403 })
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+const fallbackUsage = await usageHooks.auth.usage(async () => ({
+  type: "api",
+  key: "sk-ssekey",
+  metadata: { apiKey: "sk-ssekey", accessToken: "nap_x" },
+}))
+assert.equal(fallbackUsage.signIn, undefined)
+assert.equal(fallbackUsage.plan, "免费鸡蛋")
+assert.ok(fallbackUsage.windows.some((w) => w.name === "钱包"))
+assert.equal(
+  fallbackUsage.windows.find((w) => w.name === "订阅")?.display,
+  "订阅额度暂不可用",
+)
 
 // #5 只有访问令牌、没有 sk- 时，loader 直接返回一个清楚的 401，而不是打出去被拒。
 const viewOnlyLoader = await usageHooks.auth.loader(async () => ({

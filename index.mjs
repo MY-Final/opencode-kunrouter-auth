@@ -14,7 +14,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.7.0"
+const VERSION = "0.8.1"
 const MAGPIE_CLIENT_ID = "magpie"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
 const INVITE_CODE = (
@@ -57,60 +57,6 @@ const baseModel = {
 let statusCache = { at: 0, value: null }
 // 邀请码是否还能用，也做短缓存，避免每次加载插件都打一次站点的脸。
 let inviteCache = { code: "", at: 0, value: null }
-
-// new-api 在每次 chat 响应的 usage.quota 里塞了本期百分比和重置时间。
-// 没有访问令牌时，这条就是唯一能看到的额度信息，按令牌分开存，只留最近一条。
-const lastQuota = new Map()
-
-function rememberQuota(token, quota) {
-  const percent = Number(quota?.percent)
-  if (!token || !Number.isFinite(percent)) return
-  lastQuota.set(token, {
-    percent,
-    resetAt: Number(quota?.reset_at) || 0,
-    at: Date.now(),
-  })
-}
-
-// 站点把本期用量百分比塞在响应体的 usage.quota 里。非流式好办，
-// 流式（SSE）要扫最后一个 data: 事件，否则额度卡片永远看不到这一栏。
-function captureQuota(res, key) {
-  try {
-    const ct = res.headers.get("content-type") || ""
-    if (ct.includes("application/json")) {
-      return res
-        .clone()
-        .json()
-        .then((body) => rememberQuota(key, body?.usage?.quota))
-        .catch(() => {})
-    }
-    if (ct.includes("text/event-stream")) {
-      return res
-        .clone()
-        .text()
-        .then((text) => {
-          let quota
-          for (const line of text.split("\n")) {
-            const trimmed = line.trim()
-            if (!trimmed.startsWith("data:")) continue
-            const payload = trimmed.slice(5).trim()
-            if (!payload || payload === "[DONE]") continue
-            try {
-              const event = JSON.parse(payload)
-              if (event?.usage?.quota) quota = event.usage.quota
-            } catch {
-              /* 非法 JSON 的中间事件跳过 */
-            }
-          }
-          if (quota) rememberQuota(key, quota)
-        })
-        .catch(() => {})
-    }
-  } catch {
-    /* 记不上不影响请求本身 */
-  }
-  return Promise.resolve()
-}
 
 async function siteStatus() {
   const now = Date.now()
@@ -514,6 +460,66 @@ async function fetchSelf(key) {
   return { user: body.data }
 }
 
+// /api/subscription/self：当前订阅、钱包/订阅计费优先级。
+// /api/subscription/plans：把 plan_id 换成套餐名；即使这里失败，订阅本身仍然能显示。
+async function fetchSubscriptions(accessToken) {
+  try {
+    const [selfRes, plansRes] = await Promise.all([
+      fetch(`${SITE}/api/subscription/self`, {
+        headers: authHeaders(accessToken),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }),
+      fetch(`${SITE}/api/subscription/plans`, {
+        headers: authHeaders(accessToken),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      }),
+    ])
+    if (selfRes.status === 401) {
+      return { error: "KunRouter 说这个令牌无效或已过期", expired: true }
+    }
+    if (selfRes.status === 403) {
+      return { error: "站点还没有开放 Magpie 读取订阅额度" }
+    }
+    if (!selfRes.ok) return { error: `订阅接口返回 ${selfRes.status}` }
+    const selfBody = await selfRes.json().catch(() => null)
+    if (!selfBody?.success || !selfBody?.data) {
+      return { error: selfBody?.message || "订阅接口返回了读不懂的内容" }
+    }
+
+    let plans = []
+    if (plansRes.ok) {
+      const plansBody = await plansRes.json().catch(() => null)
+      if (Array.isArray(plansBody?.data)) plans = plansBody.data
+    }
+    const data = selfBody.data
+    return {
+      billingPreference:
+        typeof data.billing_preference === "string"
+          ? data.billing_preference
+          : "subscription_first",
+      subscriptions: Array.isArray(data.subscriptions) ? data.subscriptions : [],
+      plans,
+    }
+  } catch (e) {
+    return { error: `KunRouter 订阅接口连不上：${e}` }
+  }
+}
+
+function durationLabel(seconds) {
+  const value = Math.max(0, Number(seconds) || 0)
+  if (value > 0 && value % 86400 === 0) return `${value / 86400} 天`
+  if (value > 0 && value % 3600 === 0) return `${value / 3600} 小时`
+  if (value > 0 && value % 60 === 0) return `${value / 60} 分钟`
+  return `${Math.round(value)} 秒`
+}
+
+function quotaWindowLabel(seconds) {
+  if (Number(seconds) === 86400) return "日额度"
+  if (Number(seconds) === 604800) return "周额度"
+  if (Number(seconds) === 2592000) return "月额度"
+  return `${durationLabel(seconds)}额度`
+}
+
 // 用户在控制台删掉 Key 后，插件手里的 sk- 立刻失效，但访问令牌还在。
 // 用访问令牌重签一把同名 Key，再把新凭据写回 Magpie，下一次请求就能接着用。
 const RECOVERY_COOLDOWN_MS = 60 * 1000
@@ -613,21 +619,20 @@ export const KunRouterPlugin = async (input) => {
         key: "direct_api",
         label: "走直连域名",
         description:
-          "开（默认）：模型请求打到 direct.wcnmb.fun，绕开 Cloudflare 的 100 秒上限，长任务不容易被掐。关掉就走 wcnmb.si/v1，连通性更保险但流式长请求可能断。",
+          "默认走直连域名，避免长请求被 Cloudflare 的 100 秒上限打断；关掉改走主站。",
         default: true,
       },
       {
         key: "period_window",
-        label: "显示本期配额",
+        label: "显示订阅额度",
         description:
-          "开（默认）：把最近一次对话里站点回报的用量百分比单独显示一栏。关掉就只看钱包余额。",
+          "开（默认）：显示订阅套餐的总额、已用、剩余、到期时间和滚动窗口。关掉就只看钱包余额。",
         default: true,
       },
       {
         key: "registration_entry",
         label: "显示注册入口",
-        description:
-          "开（默认）：登录页显示「没有账号？注册并领取鸡蛋」，邀请码不可用（禁用 / 过期 / 名额满）时自动隐藏。关掉就完全不提注册。",
+        description: "登录页显示注册入口；邀请码不可用时自动隐藏。",
         default: true,
       },
     ],
@@ -774,14 +779,12 @@ export const KunRouterPlugin = async (input) => {
               if (replayable) res = await send(key, apiBase())
             }
           }
-          // 顺手记一下额度：new-api 把本期百分比放在 usage.quota 里，JSON 和 SSE 都解析。
-          captureQuota(res, key)
           return res
         },
       }
     },
 
-    // 两个窗口：钱包余额（访问令牌读得到）+ 本期配额（对话响应里带的百分比）。
+    // 钱包余额和订阅额度分开显示，避免把订阅消耗误当成钱包扣费。
     // 只有一把钥匙时只显示能读到的那一个，不假装知道另一边的数。
     async usage(getAuth) {
       const auth = await getAuth()
@@ -797,29 +800,15 @@ export const KunRouterPlugin = async (input) => {
       const currencyUnit = sym && sym !== "$" ? sym : "USD"
       const money = (n) => `${sym} ${n.toFixed(2)}`
       const windows = []
-
-      // 本期配额：new-api 把 percent 和 reset_at 塞在每次对话响应里，
-      // 记在 sk- 密钥名下，所以拿 apiKeyOf 去查（不是访问令牌）。
-      const seen = opt("period_window", true) ? lastQuota.get(apiKey || token) : undefined
-      if (seen) {
-        const resetHint = seen.resetAt
-          ? new Date(seen.resetAt * 1000).toLocaleString("zh-CN", { hour12: false })
-          : ""
-        windows.push({
-          name: "本期配额",
-          used: seen.percent,
-          ...(seen.resetAt ? { resetsAt: new Date(seen.resetAt * 1000).toISOString() } : {}),
-          // 这个百分比的准确定义还没核实（可能随时重置），先按只读处理：
-          // 显示出来，但不让路由拿它判断账号能不能用。
-          aside: true,
-          display: `已用 ${seen.percent}%${resetHint ? ` · ${resetHint} 重置` : ""}`,
-        })
-      }
+      const showSubscriptions = opt("period_window", true)
 
       // 只填了 sk- 的账号到这儿为止。
       if (!token) return { plan: "API 密钥", windows }
 
-      const self = await fetchSelf(token)
+      const [self, subscriptionData] = await Promise.all([
+        fetchSelf(token),
+        showSubscriptions ? fetchSubscriptions(token) : Promise.resolve(null),
+      ])
       if (self.error) {
         const out = { windows }
         if (self.expired) out.signIn = "expired"
@@ -830,23 +819,24 @@ export const KunRouterPlugin = async (input) => {
       const left = Number(self.user?.quota) || 0
       const spent = Number(self.user?.used_quota) || 0
       const available = left / unit
-      windows.unshift({
+      const walletWindow = {
         name: "钱包",
         balance: available,
         unit: currencyUnit,
         display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent / unit)}`,
-      })
+      }
 
-      // 一行说明，省得对着两个窗口猜哪个是钱、哪个是百分比。
-      windows.push({
-        name: "说明",
-        aside: true,
-        display: `余额取自 /api/user/self，按 ${unit} quota 兑 1 个 ${sym}；本期配额是最近一次对话时站点回报的百分比`,
-      })
+      const planTitles = new Map()
+      for (const item of subscriptionData?.plans || []) {
+        const plan = item?.plan
+        if (plan?.id != null && typeof plan.title === "string") {
+          planTitles.set(Number(plan.id), plan.title)
+        }
+      }
 
       // 分组别用授权时的快照：用户可能在控制台改过 Key 的分组。读一次真实分组，读不到再退回。
       const liveGroup = apiKey ? await currentGroup(token, apiKey) : ""
-      const plan = liveGroup
+      const group = liveGroup
         ? liveGroup
         : self.user?.group
           ? self.user.group
@@ -854,10 +844,123 @@ export const KunRouterPlugin = async (input) => {
             ? `${auth.metadata.group}（授权时）`
             : "默认分组"
 
+      const activeSubscriptions = (subscriptionData?.subscriptions || [])
+        .map((item) => item?.subscription)
+        .filter((sub) => sub?.status === "active")
+      const subscriptionWindows = []
+      for (const sub of activeSubscriptions) {
+        const title =
+          planTitles.get(Number(sub.plan_id)) || `订阅 #${sub.plan_id || "?"}`
+        const total = Number(sub.amount_total) || 0
+        const used = Math.max(0, Number(sub.amount_used) || 0)
+        const remaining = Math.max(0, total - used)
+        const totalAmount = total / unit
+        const remainingAmount = remaining / unit
+        const percent = total > 0 ? (used / total) * 100 : 0
+        const endHint = sub.end_time
+          ? new Date(Number(sub.end_time) * 1000).toLocaleDateString("zh-CN")
+          : ""
+        const allowWalletOverflow = sub.allow_wallet_overflow !== false
+
+        subscriptionWindows.push({
+          name: title,
+          used: percent,
+          amount: used / unit,
+          limit: totalAmount,
+          unit: currencyUnit,
+          balance: remainingAmount,
+          ...(sub.start_time && sub.end_time
+            ? {
+                span: Math.max(
+                  0,
+                  Number(sub.end_time) - Number(sub.start_time),
+                ),
+              }
+            : {}),
+          ...(sub.end_time
+            ? {
+                runsOutAt: new Date(Number(sub.end_time) * 1000).toISOString(),
+                runsOut: remainingAmount,
+              }
+            : {}),
+          // 套餐允许钱包兜底时，用完订阅不会让账号停摆。
+          aside: allowWalletOverflow,
+          display: `剩余 ${money(remainingAmount)} / ${money(totalAmount)}${endHint ? ` · ${endHint} 到期` : ""}`,
+        })
+
+        for (const window of Array.isArray(sub.quota_windows)
+          ? sub.quota_windows
+          : []) {
+          const windowLimit = Number(window?.quota_limit) || 0
+          const windowUsed = Math.max(0, Number(window?.used) || 0)
+          if (windowLimit <= 0) continue
+          const windowRemaining = Math.max(0, windowLimit - windowUsed)
+          const windowPercent = (windowUsed / windowLimit) * 100
+          const nextRelease = Number(window?.next_release_at) || 0
+          subscriptionWindows.push({
+            name:
+              activeSubscriptions.length > 1
+                ? `${title} · ${quotaWindowLabel(window?.window_seconds)}`
+                : quotaWindowLabel(window?.window_seconds),
+            used: windowPercent,
+            amount: windowUsed / unit,
+            limit: windowLimit / unit,
+            unit: currencyUnit,
+            balance: windowRemaining / unit,
+            span: Number(window?.window_seconds) || 0,
+            ...(nextRelease
+              ? { resetsAt: new Date(nextRelease * 1000).toISOString() }
+              : {}),
+            aside: allowWalletOverflow,
+            display: `剩余 ${money(windowRemaining / unit)} / ${money(windowLimit / unit)}`,
+          })
+        }
+      }
+
+      const subscriptionFirst =
+        subscriptionData?.billingPreference !== "wallet_first" &&
+        subscriptionData?.billingPreference !== "wallet_only"
+      const orderedWindows = subscriptionFirst
+        ? [...subscriptionWindows, walletWindow]
+        : [walletWindow, ...subscriptionWindows]
+
+      windows.unshift(...orderedWindows)
+      if (subscriptionData?.error) {
+        windows.push({
+          name: "订阅",
+          aside: true,
+          display: "订阅额度暂不可用",
+        })
+      }
+
+      const subscriptionTitles = activeSubscriptions
+        .map(
+          (sub) =>
+            planTitles.get(Number(sub.plan_id)) || `订阅 #${sub.plan_id || "?"}`,
+        )
+        .filter((title, index, titles) => titles.indexOf(title) === index)
+      const preferenceSuffix =
+        subscriptionData?.billingPreference === "wallet_first"
+          ? " · 钱包优先"
+          : subscriptionData?.billingPreference === "subscription_only"
+            ? " · 仅订阅"
+            : subscriptionData?.billingPreference === "wallet_only"
+              ? " · 仅钱包"
+              : ""
+      const planTitle = subscriptionTitles.length
+        ? subscriptionTitles.join(" / ")
+        : ""
+      const plan = `${planTitle ? `${planTitle} · ` : ""}${group}${preferenceSuffix}`
+      const until = activeSubscriptions.reduce(
+        (latest, sub) => Math.max(latest, Number(sub.end_time) || 0),
+        0,
+      )
+
       return {
         plan,
         user: self.user?.email || self.user?.username || undefined,
         balance: money(available),
+        ...(until ? { until: new Date(until * 1000).toISOString() } : {}),
         windows,
       }
     },
@@ -938,9 +1041,9 @@ export const KunRouterPlugin = async (input) => {
 export const _internal = {
   INVITE_CODE,
   apiKeyOf,
-  captureQuota,
   currentGroup,
   fetchSelf,
+  fetchSubscriptions,
   inviteCodeState,
   isAllowedAuthorizationURL,
   maskKey,

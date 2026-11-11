@@ -971,6 +971,8 @@ export const KunRouterPlugin = async (input) => {
       const key = tokenOf(auth)
       if (!key) return { outcome: "ineligible" }
 
+      // 与签到请求并行读取换算比例，避免成功后再等一次站点请求。
+      const status = siteStatus()
       let res
       try {
         res = await fetch(`${SITE}/api/user/checkin`, {
@@ -995,7 +997,9 @@ export const KunRouterPlugin = async (input) => {
         return { outcome: "failed", message: message || `KunRouter 返回 ${res.status}` }
       }
 
-      const credit = Number(body?.data?.quota_awarded ?? body?.data?.quota ?? 0) || 0
+      // 签到接口返回原始 quota，和钱包一样换算成站点显示的额度。
+      const quota = Number(body?.data?.quota_awarded ?? body?.data?.quota ?? 0) || 0
+      const credit = quota ? quota / ((await status).quotaPerUnit || DEFAULT_QUOTA_PER_UNIT) : 0
       return {
         outcome: "claimed",
         credit: credit || undefined,

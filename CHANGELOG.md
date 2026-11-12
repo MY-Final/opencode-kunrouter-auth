@@ -2,7 +2,7 @@
 
 本文件记录主要版本变化，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [未发布]
+## [0.8.2] - 2026-11-12
 
 ### 修复
 - 签到奖励按站点的额度比例换算，与钱包余额使用相同单位。

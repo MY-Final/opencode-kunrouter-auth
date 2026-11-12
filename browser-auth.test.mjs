@@ -290,25 +290,107 @@ const usage = await usageHooks.auth.usage(async () => ({
   key: "sk-ssekey",
   metadata: { apiKey: "sk-ssekey", accessToken: "nap_x" },
 }))
-assert.equal(usage.windows.find((w) => w.name === "钱包")?.unit, "🥚")
+const wallet = usage.windows.find((w) => w.name === "钱包")
+assert.equal(wallet?.unit, "🥚")
+assert.equal(wallet?.balance, 1)
 const subscription = usage.windows.find((w) => w.name === "Coding 月卡")
+assert.equal(subscription?.used, 30)
 assert.equal(subscription?.limit, 30)
 assert.equal(subscription?.amount, 9)
-assert.equal(subscription?.balance, 21)
+assert.equal(subscription?.balance, undefined)
 assert.equal(subscription?.unit, "🥚")
 assert.match(subscription?.display || "", /剩余 🥚 21\.00/)
 assert.equal(usage.plan, "Coding 月卡 · 免费鸡蛋")
 assert.ok(usage.until)
 const daily = usage.windows.find((w) => w.name === "日额度")
+assert.equal(daily?.used, 25)
 assert.equal(daily?.limit, 1)
 assert.equal(daily?.amount, 0.25)
-assert.equal(daily?.balance, 0.75)
+assert.equal(daily?.balance, undefined)
 assert.equal(daily?.span, 86400)
 assert.ok(daily?.resetsAt)
 assert.equal(daily?.aside, true)
 assert.equal(usage.windows.some((w) => w.name === "账号"), false)
 assert.equal(usage.windows.some((w) => w.name === "说明"), false)
 assert.equal(usage.windows.some((w) => w.name === "本期配额"), false)
+
+// 滚动窗口套餐的 amount_total 是 0：不显示空总窗口，31 天认作月额度。
+globalThis.fetch = async (url) => {
+  const u = String(url)
+  if (u.endsWith("/api/status")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { quota_per_unit: 500000, custom_currency_symbol: "🥚" },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.includes("/api/desktop/keys")) {
+    return new Response(JSON.stringify({ success: true, data: { items: [] } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+  if (u.endsWith("/api/user/self")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: { id: 1, username: "u", group: "kunrouter", quota: 0, used_quota: 0 },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.endsWith("/api/subscription/self")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: {
+          subscriptions: [
+            {
+              subscription: {
+                id: 10,
+                plan_id: 4,
+                status: "active",
+                amount_total: 0,
+                amount_used: 0,
+                quota_windows: [
+                  {
+                    window_seconds: 31 * 86400,
+                    quota_limit: 15000000,
+                    used: 750000,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  if (u.endsWith("/api/subscription/plans")) {
+    return new Response(
+      JSON.stringify({
+        success: true,
+        data: [{ plan: { id: 4, title: "Lite 月卡" } }],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )
+  }
+  throw new Error(`unexpected fetch: ${url}`)
+}
+const rollingUsage = await usageHooks.auth.usage(async () => ({
+  type: "api",
+  key: "sk-rolling",
+  metadata: { apiKey: "sk-rolling", accessToken: "nap_x" },
+}))
+assert.equal(rollingUsage.windows.some((w) => w.name === "Lite 月卡"), false)
+const month = rollingUsage.windows.find((w) => w.name === "月额度")
+assert.equal(month?.used, 5)
+assert.equal(month?.limit, 30)
+assert.equal(month?.amount, 1.5)
+assert.equal(month?.balance, undefined)
 
 // 老服务端没有给 Magpie 开放订阅读取时，钱包照常显示，不能误判成登录过期。
 globalThis.fetch = async (url) => {

@@ -1,6 +1,6 @@
 {
   "name": "opencode-kunrouter-auth",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "KunRouter (wcnmb.si) provider for OpenCode and magpie — browser sign-in, wallet and subscription quota, daily check-in",
   "type": "module",
   "main": "./index.mjs",

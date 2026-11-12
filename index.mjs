@@ -14,7 +14,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.8.1"
+const VERSION = "0.8.3"
 const MAGPIE_CLIENT_ID = "magpie"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
 const INVITE_CODE = (
@@ -514,9 +514,10 @@ function durationLabel(seconds) {
 }
 
 function quotaWindowLabel(seconds) {
-  if (Number(seconds) === 86400) return "日额度"
-  if (Number(seconds) === 604800) return "周额度"
-  if (Number(seconds) === 2592000) return "月额度"
+  const value = Number(seconds)
+  if (value === 86400) return "日额度"
+  if (value === 604800) return "周额度"
+  if (value >= 28 * 86400 && value <= 31 * 86400) return "月额度"
   return `${durationLabel(seconds)}额度`
 }
 
@@ -862,31 +863,34 @@ export const KunRouterPlugin = async (input) => {
           : ""
         const allowWalletOverflow = sub.allow_wallet_overflow !== false
 
-        subscriptionWindows.push({
-          name: title,
-          used: percent,
-          amount: used / unit,
-          limit: totalAmount,
-          unit: currencyUnit,
-          balance: remainingAmount,
-          ...(sub.start_time && sub.end_time
-            ? {
-                span: Math.max(
-                  0,
-                  Number(sub.end_time) - Number(sub.start_time),
-                ),
-              }
-            : {}),
-          ...(sub.end_time
-            ? {
-                runsOutAt: new Date(Number(sub.end_time) * 1000).toISOString(),
-                runsOut: remainingAmount,
-              }
-            : {}),
-          // 套餐允许钱包兜底时，用完订阅不会让账号停摆。
-          aside: allowWalletOverflow,
-          display: `剩余 ${money(remainingAmount)} / ${money(totalAmount)}${endHint ? ` · ${endHint} 到期` : ""}`,
-        })
+        // 滚动窗口套餐把额度全放在 quota_windows 里，amount_total 是 0；
+        // 这时不画一条 0 / 0 的空进度条。
+        if (total > 0) {
+          subscriptionWindows.push({
+            name: title,
+            used: percent,
+            amount: used / unit,
+            limit: totalAmount,
+            unit: currencyUnit,
+            ...(sub.start_time && sub.end_time
+              ? {
+                  span: Math.max(
+                    0,
+                    Number(sub.end_time) - Number(sub.start_time),
+                  ),
+                }
+              : {}),
+            ...(sub.end_time
+              ? {
+                  runsOutAt: new Date(Number(sub.end_time) * 1000).toISOString(),
+                  runsOut: remainingAmount,
+                }
+              : {}),
+            // 套餐允许钱包兜底时，用完订阅不会让账号停摆。
+            aside: allowWalletOverflow,
+            display: `剩余 ${money(remainingAmount)} / ${money(totalAmount)}${endHint ? ` · ${endHint} 到期` : ""}`,
+          })
+        }
 
         for (const window of Array.isArray(sub.quota_windows)
           ? sub.quota_windows
@@ -906,7 +910,6 @@ export const KunRouterPlugin = async (input) => {
             amount: windowUsed / unit,
             limit: windowLimit / unit,
             unit: currencyUnit,
-            balance: windowRemaining / unit,
             span: Number(window?.window_seconds) || 0,
             ...(nextRelease
               ? { resetsAt: new Date(nextRelease * 1000).toISOString() }

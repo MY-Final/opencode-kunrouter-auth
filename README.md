@@ -64,11 +64,27 @@ magpie plugin login kunrouter
 
 ## 域名
 
-- `https://wcnmb.si/api` —— 控制台和管理接口
-- `https://kuncode.120403.xyz/desktop/authorize` —— 浏览器授权页
-- `https://direct.wcnmb.fun/v1` —— 直连模型请求，绕开 Cloudflare 100 秒上限
+- `https://wcnmb.si`、`https://wcnmb.fun`、`https://kuncode.120403.xyz` —— 三个可用的控制台与授权入口。
+- `https://wcnmb.si/api` —— 插件默认的控制台和管理接口。
+- `https://direct.wcnmb.fun/v1`、`https://direct.wcnmb.si/v1` —— 模型 API 直连端点，不提供登录页。
 
-直连域名网络层挂了会自动回退一次主站 `wcnmb.si/v1`。授权地址只认 `wcnmb.si`、`wcnmb.fun`、`kuncode.120403.xyz` 及其子域下的 `/desktop/authorize`。
+登录时会直接显示三个浏览器入口，用户不用猜当前控制台对应哪个域名：
+
+- `浏览器登录（推荐） · wcnmb.fun`
+- `浏览器登录 · wcnmb.si`
+- `浏览器登录 · kuncode.120403.xyz`
+
+不设置环境变量时，`wcnmb.fun` 排在第一位，即使服务端 `ServerAddress` 当前配置为 `https://kuncode.120403.xyz`。本地回调始终是 `http://127.0.0.1:随机端口/callback`，不会使用任何公网域名。
+
+`KUNROUTER_AUTH_ORIGIN` 可以调整哪个入口排在第一位；另外两个入口仍会保留：
+
+```sh
+KUNROUTER_AUTH_ORIGIN=https://wcnmb.si magpie plugin login kunrouter
+```
+
+插件会保留服务端签发的 `flow`，只把 `/desktop/authorize` 的域名换为用户选中的入口。该配置只接受上述三个纯 HTTPS 源地址之一；`direct.*` 不会作为授权入口。一次授权只使用一个固定域名，不在域名间轮询或中途切换，避免 Cookie、Passkey 和登录态不一致。
+
+直连域名网络层挂了会自动回退一次主站 `/v1`。三个公网控制台需要保持同一套登录会话和授权前端；Passkey 站点范围由服务端的 `passkey_rp_ids` 管理。
 
 ## 本地联调
 

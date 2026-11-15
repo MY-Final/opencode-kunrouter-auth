@@ -2,6 +2,13 @@
 
 本文件记录主要版本变化，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.5] - 2026-11-15
+
+### 修复
+- `KUNROUTER_AUTH_ORIGIN` 现在会真正改写浏览器授权页域名，并保留服务端签发的一次性 flow；默认授权入口改为 `https://wcnmb.fun`。
+- 登录页直接提供 `wcnmb.fun`、`wcnmb.si`、`kuncode.120403.xyz` 三个选择，用户不必猜当前该用哪个入口；环境变量只调整推荐顺序。
+- 三个公网控制台都使用同一个本地 `127.0.0.1` 回调；`direct.*` 仅用于模型 API，不受信任或格式错误的授权域名会在发起请求前返回明确提示。
+
 ## [0.8.4] - 2026-11-15
 
 ### 修复

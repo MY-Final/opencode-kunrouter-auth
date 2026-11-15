@@ -37,6 +37,7 @@ const DEFAULT_QUOTA_PER_UNIT = 500000
 const STATUS_TTL_MS = 10 * 60 * 1000
 // 站点 /api 请求统一超时，免得网络卡住时额度卡和签到一起挂死。
 const REQUEST_TIMEOUT_MS = 10000
+const AUTHORIZATION_TIMEOUT_MS = 5 * 60 * 1000
 const INVITE_STATUS_TTL_MS = 5 * 60 * 1000
 // 插件加载时要等这次邀请码检查，超时放短一点，别因为站点慢拖住整个插件。
 const INVITE_CHECK_TIMEOUT_MS = 2500
@@ -58,22 +59,43 @@ let statusCache = { at: 0, value: null }
 // 邀请码是否还能用，也做短缓存，避免每次加载插件都打一次站点的脸。
 let inviteCache = { code: "", at: 0, value: null }
 
-async function siteStatus() {
+function requestSignal(signal, timeout = REQUEST_TIMEOUT_MS) {
+  return signal ? AbortSignal.any([signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout)
+}
+
+function finite(value, fallback = 0) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function timestamp(value) {
+  const seconds = finite(value)
+  if (seconds <= 0) return undefined
+  const date = new Date(seconds * 1000)
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+}
+
+function authExpired(status, body) {
+  return status === 401 || /^(AUTH_UNAUTHORIZED|ACCESS_TOKEN_LEGACY_RETIRED|ACCESS_TOKEN_EXPIRED)$/.test(String(body?.code || body?.message_key || ""))
+}
+
+async function siteStatus(signal) {
   const now = Date.now()
   if (statusCache.value && now - statusCache.at < STATUS_TTL_MS) return statusCache.value
   try {
     const res = await fetch(`${SITE}/api/status`, {
       headers: clientHeaders(),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: requestSignal(signal),
     })
     if (!res.ok) return statusCache.value ?? {}
     const data = (await res.json())?.data ?? {}
     const value = {
-      quotaPerUnit: Number(data.quota_per_unit) || DEFAULT_QUOTA_PER_UNIT,
+      quotaPerUnit: finite(data.quota_per_unit) > 0 ? Number(data.quota_per_unit) : DEFAULT_QUOTA_PER_UNIT,
       symbol: typeof data.custom_currency_symbol === "string" && data.custom_currency_symbol
         ? data.custom_currency_symbol
         : "$",
       name: data.system_name || "KunRouter",
+      checkinEnabled: typeof data.checkin_enabled === "boolean" ? data.checkin_enabled : undefined,
     }
     statusCache = { at: now, value }
     return value
@@ -137,22 +159,33 @@ function maskKey(key) {
 
 // 额度卡上的分组别用授权时的快照：用户可能在控制台改过 Key 的分组。
 // 拿访问令牌列表里按遮罩匹配出真实分组，读不到就交给调用方退回快照。
-async function currentGroup(accessToken, apiKey) {
-  if (!accessToken) return ""
+async function currentGroup(accessToken, apiKey, keyId, signal) {
+  if (!accessToken || !apiKey) return ""
+  const bounded = requestSignal(signal)
   try {
-    const res = await fetch(`${SITE}/api/desktop/keys?p=1&page_size=100`, {
-      headers: authHeaders(accessToken),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    })
-    if (!res.ok) return ""
-    const body = await res.json().catch(() => null)
-    const items = body?.data?.items
-    if (!Array.isArray(items) || items.length === 0) return ""
-    const masked = maskKey(apiKey)
-    const match =
-      (masked && items.find((item) => item?.masked_key === masked)) ||
-      (items.length === 1 ? items[0] : null)
-    return typeof match?.group === "string" ? match.group : ""
+    if (Number.isSafeInteger(Number(keyId)) && Number(keyId) > 0) {
+      const res = await fetch(`${SITE}/api/desktop/keys/${Number(keyId)}`, {
+        headers: authHeaders(accessToken), signal: bounded,
+      })
+      if (res.ok) {
+        const item = (await res.json())?.data
+        if (item?.masked_key === maskKey(apiKey) && typeof item.group === "string") return item.group
+      }
+    }
+    for (let page = 1; ; page++) {
+      bounded.throwIfAborted()
+      const res = await fetch(`${SITE}/api/desktop/keys?p=${page}&page_size=100`, {
+        headers: authHeaders(accessToken), signal: bounded,
+      })
+      if (!res.ok) return ""
+      const data = (await res.json())?.data
+      const items = data?.items
+      if (!Array.isArray(items) || items.length === 0) return ""
+      const matches = items.filter((item) => item?.masked_key === maskKey(apiKey))
+      if (matches.length > 1) return ""
+      if (matches.length === 1) return typeof matches[0].group === "string" ? matches[0].group : ""
+      if (items.length < 100 || page * 100 >= finite(data.total, Infinity)) return ""
+    }
   } catch {
     return ""
   }
@@ -275,7 +308,7 @@ function waitForLoopbackCallback(server, expectedState, signal) {
       signal?.removeEventListener("abort", onAbort)
       fn(value)
     }
-    const onAbort = () => finish(reject, new Error("浏览器授权已取消"))
+    const onAbort = () => finish(reject, new Error(signal?.reason?.name === "TimeoutError" ? "浏览器授权已超时，请重试" : "浏览器授权已取消"))
     if (signal?.aborted) {
       reject(new Error("浏览器授权已取消"))
       return
@@ -330,6 +363,7 @@ function waitForLoopbackCallback(server, expectedState, signal) {
 
 async function startBrowserAuthorization(signal, options = {}) {
   const server = createServer()
+  const lifetime = requestSignal(signal, options.timeoutMs ?? AUTHORIZATION_TIMEOUT_MS)
   try {
     const port = await listenLoopback(server)
     const redirectURI = `http://127.0.0.1:${port}/callback`
@@ -348,7 +382,7 @@ async function startBrowserAuthorization(signal, options = {}) {
         code_challenge: challenge,
         code_challenge_method: "S256",
       }),
-      signal,
+      signal: requestSignal(lifetime),
     })
     const started = await responseJSON(res)
     if (!isAllowedAuthorizationURL(started?.authorization_url)) {
@@ -359,9 +393,10 @@ async function startBrowserAuthorization(signal, options = {}) {
       authorizationURL.searchParams.set("mode", "register")
       authorizationURL.searchParams.set("invite_code", INVITE_CODE)
     }
-    const callbackPromise = waitForLoopbackCallback(server, state, signal)
+    const callbackPromise = waitForLoopbackCallback(server, state, lifetime)
     const closeOnAbort = () => server.close()
-    signal?.addEventListener("abort", closeOnAbort, { once: true })
+    lifetime.addEventListener("abort", closeOnAbort, { once: true })
+    if (lifetime.aborted) closeOnAbort()
     callbackPromise.catch(() => {})
     return {
       url: authorizationURL.toString(),
@@ -380,7 +415,7 @@ async function startBrowserAuthorization(signal, options = {}) {
               code_verifier: verifier,
               redirect_uri: redirectURI,
             }),
-            signal,
+            signal: requestSignal(lifetime),
           })
           const data = await responseJSON(exchange)
           const accessToken = String(data?.access_token || "").trim()
@@ -411,7 +446,7 @@ async function startBrowserAuthorization(signal, options = {}) {
         } catch (error) {
           return authorizationError(error)
         } finally {
-          signal?.removeEventListener("abort", closeOnAbort)
+          lifetime.removeEventListener("abort", closeOnAbort)
           server.close()
         }
       },
@@ -423,30 +458,34 @@ async function startBrowserAuthorization(signal, options = {}) {
 }
 
 // /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
-async function listModels(apiKey) {
-  const res = await fetch(`${API}/v1/models`, {
-    headers: authHeaders(apiKey),
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  })
+async function listModels(apiKey, base = API, signal) {
+  const bounded = requestSignal(signal)
+  let res
+  try {
+    res = await fetch(`${base}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
+  } catch (error) {
+    if (base !== API || bounded.aborted || API === SITE) throw error
+    res = await fetch(`${SITE}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
+  }
   return { ok: res.ok, status: res.status, res }
 }
 
 // /api/user/self：余额查这里，也是校验令牌是否还有效的唯一办法。
-async function fetchSelf(key) {
+async function fetchSelf(key, signal) {
   let res
   try {
     res = await fetch(`${SITE}/api/user/self`, {
       headers: authHeaders(key),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: requestSignal(signal),
     })
   } catch (e) {
     return { error: `KunRouter 连不上：${e}` }
   }
-  if (res.status === 401 || res.status === 403) {
+  const body = await res.json().catch(() => null)
+  if (authExpired(res.status, body)) {
     return { error: "KunRouter 说这个令牌无效或已过期", expired: true }
   }
   if (!res.ok) return { error: `KunRouter 返回 ${res.status}` }
-  const body = await res.json().catch(() => null)
   if (!body?.success || !body?.data) {
     const code = String(body?.code || body?.message_key || "")
     if (code.includes("ACCESS_TOKEN_LEGACY_RETIRED")) {
@@ -462,35 +501,32 @@ async function fetchSelf(key) {
 
 // /api/subscription/self：当前订阅、钱包/订阅计费优先级。
 // /api/subscription/plans：把 plan_id 换成套餐名；即使这里失败，订阅本身仍然能显示。
-async function fetchSubscriptions(accessToken) {
+async function fetchSubscriptions(accessToken, signal) {
   try {
-    const [selfRes, plansRes] = await Promise.all([
+    const [selfResult, plansRes] = await Promise.all([
       fetch(`${SITE}/api/subscription/self`, {
         headers: authHeaders(accessToken),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      }),
+        signal: requestSignal(signal),
+      }).then(async (res) => ({ res, body: await res.json().catch(() => null) })),
       fetch(`${SITE}/api/subscription/plans`, {
         headers: authHeaders(accessToken),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      }),
+        signal: requestSignal(signal),
+      }).then(async (res) => res.ok ? await res.json().catch(() => null) : null).catch(() => null),
     ])
-    if (selfRes.status === 401) {
+    const { res: selfRes, body: selfBody } = selfResult
+    if (authExpired(selfRes.status, selfBody)) {
       return { error: "KunRouter 说这个令牌无效或已过期", expired: true }
     }
     if (selfRes.status === 403) {
       return { error: "站点还没有开放 Magpie 读取订阅额度" }
     }
     if (!selfRes.ok) return { error: `订阅接口返回 ${selfRes.status}` }
-    const selfBody = await selfRes.json().catch(() => null)
     if (!selfBody?.success || !selfBody?.data) {
       return { error: selfBody?.message || "订阅接口返回了读不懂的内容" }
     }
 
     let plans = []
-    if (plansRes.ok) {
-      const plansBody = await plansRes.json().catch(() => null)
-      if (Array.isArray(plansBody?.data)) plans = plansBody.data
-    }
+    if (Array.isArray(plansRes?.data)) plans = plansRes.data
     const data = selfBody.data
     return {
       billingPreference:
@@ -519,6 +555,80 @@ function quotaWindowLabel(seconds) {
   if (value === 604800) return "周额度"
   if (value >= 28 * 86400 && value <= 31 * 86400) return "月额度"
   return `${durationLabel(seconds)}额度`
+}
+
+function modelInfo(model, previous, base) {
+  const id = model.id
+  const levels = model.supported_reasoning_levels ?? model.reasoning_levels
+  const explicit = Array.isArray(levels)
+    ? [...new Set(levels.map((level) => typeof level === "string" ? level : level?.effort)
+        .filter((level) => typeof level === "string" && level.length > 0))]
+    : undefined
+  const efforts = explicit ?? (Object.keys(previous?.variants ?? {}).length ? Object.keys(previous.variants)
+    : /^gpt-(?:5|6)(?:[.-]|$)/i.test(id) ? ["low", "medium", "high", "xhigh"] : undefined)
+  const reasoning = model.reasoning ?? model.capabilities?.reasoning
+    ?? (efforts ? efforts.length > 0 : previous?.capabilities?.reasoning ?? false)
+  const capabilities = {
+    input: { text: true, ...previous?.capabilities?.input },
+    output: { text: true, ...previous?.capabilities?.output },
+    ...previous?.capabilities,
+    ...model.capabilities,
+    reasoning: !!reasoning && explicit?.length !== 0,
+  }
+  capabilities.toolcall = model.tool_call ?? model.capabilities?.toolcall ?? previous?.capabilities?.toolcall ?? true
+  for (const kind of ["input", "output"]) {
+    const kinds = model.modalities?.[kind]
+    if (Array.isArray(kinds)) capabilities[kind] = Object.fromEntries(
+      ["text", "image", "audio", "video", "pdf"].map((name) => [name, kinds.includes(name)]))
+  }
+  const positive = (value, fallback) => finite(value) > 0 ? Number(value) : fallback
+  return {
+    ...previous,
+    id, providerID: PROVIDER,
+    name: model.display_name || model.name || previous?.name || id,
+    api: { ...previous?.api, id, url: `${base}/v1`, npm: previous?.api?.npm ?? "@ai-sdk/openai-compatible" },
+    limit: {
+      ...previous?.limit,
+      context: positive(model.limit?.context ?? model.context_window, previous?.limit?.context ?? baseModel.limit.context),
+      output: positive(model.limit?.output ?? model.max_output_tokens, previous?.limit?.output ?? baseModel.limit.output),
+    },
+    headers: previous?.headers ?? {}, options: previous?.options ?? {},
+    cost: previous?.cost ?? { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    release_date: model.release_date ?? previous?.release_date ?? "",
+    status: previous?.status ?? "active",
+    capabilities,
+    variants: !capabilities.reasoning ? {} : efforts
+      ? Object.fromEntries(efforts.map((effort) => [effort, previous?.variants?.[effort] ?? { reasoningEffort: effort }]))
+      : previous?.variants ?? {},
+  }
+}
+
+// 服务端尝试任意一个可用订阅，每个订阅内部的窗口才是同时约束。
+// 只让当前可用的资金来源参与 Magpie 的 AND 额度判断，其余明细照常展示。
+function routeWindows(wallet, subscriptions, preference, known) {
+  wallet.aside = true
+  for (const { windows } of subscriptions) for (const window of windows) window.aside = true
+  const best = subscriptions.reduce((was, item) => {
+    const used = Math.max(0, ...item.windows.map((w) => w.used))
+    return !was || used < was.used ? { ...item, used } : was
+  }, null)
+  const useSubscription = () => {
+    if (!best) return false
+    for (const window of best.windows) window.aside = false
+    return true
+  }
+  if (preference === "wallet_only") wallet.aside = false
+  else if (!known) {
+    // 未知订阅状态不能把钱包为零误当作整个账号耗尽。
+    if (wallet.balance > 0) wallet.aside = false
+  } else if (preference === "subscription_only") {
+    if (!useSubscription()) return { name: "订阅", used: 100, display: "没有可用订阅" }
+  } else if (preference === "wallet_first") {
+    if (wallet.balance > 0 || !useSubscription()) wallet.aside = false
+  } else if (best && best.used < 100) useSubscription()
+  else if (!subscriptions.length || subscriptions.every((s) => s.sub.allow_wallet_overflow !== false)) wallet.aside = false
+  else useSubscription()
+  return null
 }
 
 // 用户在控制台删掉 Key 后，插件手里的 sk- 立刻失效，但访问令牌还在。
@@ -627,7 +737,7 @@ export const KunRouterPlugin = async (input) => {
         key: "period_window",
         label: "显示订阅额度",
         description:
-          "开（默认）：显示订阅套餐的总额、已用、剩余、到期时间和滚动窗口。关掉就只看钱包余额。",
+          "开（默认）：显示全部订阅额度和滚动窗口。关掉隐藏辅助明细，仍保留当前参与路由的额度。",
         default: true,
       },
       {
@@ -694,7 +804,7 @@ export const KunRouterPlugin = async (input) => {
 
           // 顺手验一下 sk- 能不能列模型，省得进了列表才发现拉不到。
           if (apiKey) {
-            const probe = await listModels(apiKey).catch(() => null)
+            const probe = await listModels(apiKey, apiBase()).catch(() => null)
             if (!probe) return { type: "failed", error: "API 密钥连不上 /v1/models，确认一下是不是复制全了" }
             if (!probe.ok) return { type: "failed", error: `API 密钥被拒绝（HTTP ${probe.status}）` }
           }
@@ -738,46 +848,41 @@ export const KunRouterPlugin = async (input) => {
       return {
         baseURL: `${apiBase()}/v1`,
         async fetch(input, init) {
+          const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
+          const replayable = !(input instanceof Request && input.body) && (
+            init?.body == null || typeof init.body === "string" ||
+            init.body instanceof Uint8Array || init.body instanceof ArrayBuffer)
           const send = (secret, base) => {
-            const headers = new Headers(init?.headers)
+            const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
             headers.set("authorization", `Bearer ${secret}`)
             for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
             // loader 已经用 apiBase 拼好完整 URL，回退时把直连域名换回主站。
-            const target =
-              base === SITE && typeof input === "string" && input.startsWith(API)
-                ? `${SITE}${input.slice(API.length)}`
-                : input
-            return fetch(target, { ...init, headers })
+            const url = input instanceof Request ? input.url : String(input)
+            const target = base === SITE && url.startsWith(`${API}/`)
+              ? `${SITE}${url.slice(API.length)}` : url
+            return fetch(input instanceof Request ? new Request(target, input) : target, { ...init, headers })
           }
           let res
+          let base = apiBase()
           try {
-            res = await send(key, apiBase())
+            res = await send(key, base)
           } catch (error) {
             // 直连域名网络层挂了（DNS / 连不上）时回退一次主站，别让明明还能用的站白等。
-            const replayable =
-              init?.body == null ||
-              typeof init.body === "string" ||
-              init.body instanceof Uint8Array ||
-              init.body instanceof ArrayBuffer
-            if (apiBase() === API && replayable) {
-              res = await send(key, SITE)
+            if (base === API && replayable && !signal?.aborted && error?.name !== "AbortError") {
+              base = SITE
+              res = await send(key, base)
             } else {
               throw error
             }
           }
           // Key 被控制台删掉后 /v1 会直接 401。访问令牌还能用就重签一把再试。
-          if (res.status === 401) {
+          if (res.status === 401 && !signal?.aborted) {
             const recovered = await recoverApiKey(tokenOf(auth), auth?.metadata?.group)
             if (recovered?.key) {
               key = recovered.key
               await saveRecoveredAuth(client, auth, recovered)
               // 请求体已经被读掉（流式上传）时没法重放，留给下一次请求。
-              const replayable =
-                init?.body == null ||
-                typeof init.body === "string" ||
-                init.body instanceof Uint8Array ||
-                init.body instanceof ArrayBuffer
-              if (replayable) res = await send(key, apiBase())
+              if (replayable && !signal?.aborted) res = await send(key, base)
             }
           }
           return res
@@ -787,14 +892,21 @@ export const KunRouterPlugin = async (input) => {
 
     // 钱包余额和订阅额度分开显示，避免把订阅消耗误当成钱包扣费。
     // 只有一把钥匙时只显示能读到的那一个，不假装知道另一边的数。
-    async usage(getAuth) {
+    async usage(getAuth, _provider, { signal } = {}) {
       const auth = await getAuth()
       if (auth?.type !== "api") return { windows: [] }
       const token = tokenOf(auth)
       const apiKey = apiKeyOf(auth)
       if (!token && !apiKey) return { windows: [] }
 
-      const status = await siteStatus()
+      // 全部读取共享一个预算，并行开始，辅助信息不会再串行增加 10 秒。
+      const bounded = requestSignal(signal)
+      const [status, self, subscriptionData, liveGroup] = await Promise.all([
+        siteStatus(bounded),
+        token ? fetchSelf(token, bounded) : Promise.resolve(null),
+        token ? fetchSubscriptions(token, bounded) : Promise.resolve(null),
+        token && apiKey ? currentGroup(token, apiKey, auth.metadata?.apiKeyId, bounded) : Promise.resolve(""),
+      ])
       const unit = status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT
       const sym = status.symbol || "$"
       // 窗口单位跟着站点币种走（本站是 🥚），别写死成美元。
@@ -806,25 +918,20 @@ export const KunRouterPlugin = async (input) => {
       // 只填了 sk- 的账号到这儿为止。
       if (!token) return { plan: "API 密钥", windows }
 
-      const [self, subscriptionData] = await Promise.all([
-        fetchSelf(token),
-        showSubscriptions ? fetchSubscriptions(token) : Promise.resolve(null),
-      ])
-      if (self.error) {
+      if (self.error && (self.expired || subscriptionData?.error)) {
         const out = { windows }
         if (self.expired) out.signIn = "expired"
         if (!windows.length) out.error = self.error
         return out
       }
 
-      const left = Number(self.user?.quota) || 0
-      const spent = Number(self.user?.used_quota) || 0
+      const left = Math.max(0, finite(self.user?.quota))
       const available = left / unit
       const walletWindow = {
         name: "钱包",
-        balance: available,
+        ...(!self.error ? { balance: available } : {}),
         unit: currencyUnit,
-        display: `${sym} ${available.toFixed(2)} 可用 · 已用 ${money(spent / unit)}`,
+        display: self.error ? "钱包余额暂不可用" : `${sym} ${available.toFixed(2)} 可用`,
       }
 
       const planTitles = new Map()
@@ -836,43 +943,43 @@ export const KunRouterPlugin = async (input) => {
       }
 
       // 分组别用授权时的快照：用户可能在控制台改过 Key 的分组。读一次真实分组，读不到再退回。
-      const liveGroup = apiKey ? await currentGroup(token, apiKey) : ""
       const group = liveGroup
         ? liveGroup
-        : self.user?.group
-          ? self.user.group
-          : auth.metadata?.group
+        : auth.metadata?.group
             ? `${auth.metadata.group}（授权时）`
-            : "默认分组"
+            : self.user?.group ? `${self.user.group}（账号默认）` : "默认分组"
 
       const activeSubscriptions = (subscriptionData?.subscriptions || [])
         .map((item) => item?.subscription)
-        .filter((sub) => sub?.status === "active")
+        .filter((sub) => sub?.status === "active" &&
+          (sub.end_time == null || sub.end_time === 0 || (timestamp(sub.end_time) && Number(sub.end_time) * 1000 > Date.now())))
       const subscriptionWindows = []
+      const subscriptionRoutes = []
       for (const sub of activeSubscriptions) {
+        const ownWindows = []
         const title =
           planTitles.get(Number(sub.plan_id)) || `订阅 #${sub.plan_id || "?"}`
-        const total = Number(sub.amount_total) || 0
-        const used = Math.max(0, Number(sub.amount_used) || 0)
+        const total = Math.max(0, finite(sub.amount_total))
+        const used = Math.max(0, finite(sub.amount_used))
         const remaining = Math.max(0, total - used)
         const totalAmount = total / unit
         const remainingAmount = remaining / unit
         const percent = total > 0 ? (used / total) * 100 : 0
-        const endHint = sub.end_time
+        const endsAt = timestamp(sub.end_time)
+        const endHint = endsAt
           ? new Date(Number(sub.end_time) * 1000).toLocaleDateString("zh-CN")
           : ""
-        const allowWalletOverflow = sub.allow_wallet_overflow !== false
 
         // 滚动窗口套餐把额度全放在 quota_windows 里，amount_total 是 0；
         // 这时不画一条 0 / 0 的空进度条。
         if (total > 0) {
-          subscriptionWindows.push({
+          ownWindows.push({
             name: title,
             used: percent,
             amount: used / unit,
             limit: totalAmount,
             unit: currencyUnit,
-            ...(sub.start_time && sub.end_time
+            ...(timestamp(sub.start_time) && endsAt
               ? {
                   span: Math.max(
                     0,
@@ -880,14 +987,13 @@ export const KunRouterPlugin = async (input) => {
                   ),
                 }
               : {}),
-            ...(sub.end_time
+            ...(endsAt
               ? {
-                  runsOutAt: new Date(Number(sub.end_time) * 1000).toISOString(),
+                  runsOutAt: endsAt,
                   runsOut: remainingAmount,
                 }
               : {}),
-            // 套餐允许钱包兜底时，用完订阅不会让账号停摆。
-            aside: allowWalletOverflow,
+            aside: true,
             display: `剩余 ${money(remainingAmount)} / ${money(totalAmount)}${endHint ? ` · ${endHint} 到期` : ""}`,
           })
         }
@@ -895,13 +1001,13 @@ export const KunRouterPlugin = async (input) => {
         for (const window of Array.isArray(sub.quota_windows)
           ? sub.quota_windows
           : []) {
-          const windowLimit = Number(window?.quota_limit) || 0
-          const windowUsed = Math.max(0, Number(window?.used) || 0)
+          const windowLimit = finite(window?.quota_limit)
+          const windowUsed = Math.max(0, finite(window?.used))
           if (windowLimit <= 0) continue
           const windowRemaining = Math.max(0, windowLimit - windowUsed)
           const windowPercent = (windowUsed / windowLimit) * 100
-          const nextRelease = Number(window?.next_release_at) || 0
-          subscriptionWindows.push({
+          const nextRelease = timestamp(window?.next_release_at)
+          ownWindows.push({
             name:
               activeSubscriptions.length > 1
                 ? `${title} · ${quotaWindowLabel(window?.window_seconds)}`
@@ -910,15 +1016,20 @@ export const KunRouterPlugin = async (input) => {
             amount: windowUsed / unit,
             limit: windowLimit / unit,
             unit: currencyUnit,
-            span: Number(window?.window_seconds) || 0,
+            span: Math.max(0, finite(window?.window_seconds)),
             ...(nextRelease
-              ? { resetsAt: new Date(nextRelease * 1000).toISOString() }
+              ? { resetsAt: nextRelease }
               : {}),
-            aside: allowWalletOverflow,
+            aside: true,
             display: `剩余 ${money(windowRemaining / unit)} / ${money(windowLimit / unit)}`,
           })
         }
+        subscriptionWindows.push(...ownWindows)
+        subscriptionRoutes.push({ sub, windows: ownWindows })
       }
+
+      const unavailable = routeWindows(walletWindow, subscriptionRoutes,
+        subscriptionData?.billingPreference, !subscriptionData?.error)
 
       const subscriptionFirst =
         subscriptionData?.billingPreference !== "wallet_first" &&
@@ -927,7 +1038,13 @@ export const KunRouterPlugin = async (input) => {
         ? [...subscriptionWindows, walletWindow]
         : [walletWindow, ...subscriptionWindows]
 
-      windows.unshift(...orderedWindows)
+      if (showSubscriptions) windows.push(...orderedWindows)
+      else {
+        windows.push(walletWindow)
+        const routing = subscriptionWindows.filter((window) => !window.aside)
+        if (routing.length) windows.push(...routing)
+      }
+      if (unavailable) windows.push(unavailable)
       if (subscriptionData?.error) {
         windows.push({
           name: "订阅",
@@ -955,44 +1072,47 @@ export const KunRouterPlugin = async (input) => {
         : ""
       const plan = `${planTitle ? `${planTitle} · ` : ""}${group}${preferenceSuffix}`
       const until = activeSubscriptions.reduce(
-        (latest, sub) => Math.max(latest, Number(sub.end_time) || 0),
+        (latest, sub) => Math.max(latest, timestamp(sub.end_time) ? Number(sub.end_time) : 0),
         0,
       )
 
       return {
         plan,
         user: self.user?.email || self.user?.username || undefined,
-        balance: money(available),
+        ...(!self.error ? { balance: money(available) } : {}),
+        signIn: "kept",
         ...(until ? { until: new Date(until * 1000).toISOString() } : {}),
         windows,
       }
     },
 
     // 站点开着每日签到（/api/status 的 checkin_enabled），顺手替账号签了。
-    async checkin(getAuth) {
+    async checkin(getAuth, _provider, { signal } = {}) {
       const auth = await getAuth()
       const key = tokenOf(auth)
       if (!key) return { outcome: "ineligible" }
 
-      // 与签到请求并行读取换算比例，避免成功后再等一次站点请求。
-      const status = siteStatus()
+      // 先确认站点开启签到；状态读取和签到共享一次请求预算。
+      const bounded = requestSignal(signal)
+      const status = await siteStatus(bounded)
+      if (status.checkinEnabled === false) return { outcome: "inactive", message: "站点未开启每日签到" }
       let res
       try {
         res = await fetch(`${SITE}/api/user/checkin`, {
           method: "POST",
           headers: { ...authHeaders(key), "content-type": "application/json" },
           body: "{}",
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          signal: bounded,
         })
       } catch (e) {
         return { outcome: "failed", message: `KunRouter 连不上：${e}` }
       }
 
-      if (res.status === 401 || res.status === 403) {
+      const body = await res.json().catch(() => ({}))
+      if (authExpired(res.status, body)) {
         throw Object.assign(new Error("KunRouter 说这个令牌无效或已过期"), { signIn: "expired" })
       }
 
-      const body = await res.json().catch(() => ({}))
       const message = typeof body?.message === "string" ? body.message : ""
       if (!res.ok || body?.success === false) {
         // 「今天已签到」是正常的 done，不是失败。
@@ -1001,8 +1121,8 @@ export const KunRouterPlugin = async (input) => {
       }
 
       // 签到接口返回原始 quota，和钱包一样换算成站点显示的额度。
-      const quota = Number(body?.data?.quota_awarded ?? body?.data?.quota ?? 0) || 0
-      const credit = quota ? quota / ((await status).quotaPerUnit || DEFAULT_QUOTA_PER_UNIT) : 0
+      const quota = finite(body?.data?.quota_awarded ?? body?.data?.quota)
+      const credit = quota ? quota / (status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT) : 0
       return {
         outcome: "claimed",
         credit: credit || undefined,
@@ -1011,34 +1131,33 @@ export const KunRouterPlugin = async (input) => {
     },
   },
 
-  // 站点的模型列表是公开的（要 key），拉一次就够了，拉不到就保留上一份。
+  // 每次宿主发现模型时读取当前账号的列表；失败保留宿主已有列表。
   provider: {
     id: PROVIDER,
-    async models(provider, { auth } = {}) {
+    async models(provider, { auth, signal } = {}) {
       if (auth?.type !== "api") return provider.models
       const key = apiKeyOf(auth)
       if (!key) return provider.models
+      const fallback = () => Object.defineProperty({ ...provider.models }, Symbol.for("magpie.fellBack"), { value: true })
 
       let list
       try {
-        const res = await fetch(`${API}/v1/models`, {
-          headers: authHeaders(key),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        })
-        if (!res.ok) return provider.models
+        const { res } = await listModels(key, apiBase(), signal)
+        if (!res.ok) return fallback()
         const body = await res.json()
-        list = Array.isArray(body?.data) ? body.data : []
+        if (!Array.isArray(body?.data)) return fallback()
+        list = body.data
       } catch {
-        return provider.models
+        return fallback()
       }
 
       const out = {}
       for (const m of list) {
         const id = typeof m?.id === "string" ? m.id : ""
         if (!id) continue
-        out[id] = { ...baseModel, name: id }
+        out[id] = modelInfo(m, provider.models?.[id], apiBase())
       }
-      return Object.keys(out).length ? out : provider.models
+      return out
     },
   },
   }

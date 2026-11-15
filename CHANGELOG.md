@@ -2,7 +2,7 @@
 
 本文件记录主要版本变化，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.8.4] - 2026-11-15
 
 ### 修复
 - 模型发现返回完整能力和推理档位，供 Codex 选择思考程度；优先使用接口声明和宿主已有值。

@@ -42,9 +42,14 @@ globalThis.fetch = async (input, init = {}) => {
 const authorization = await _internal.startBrowserAuthorization()
 assert.equal(
   authorization.url,
-  "https://wcnmb.si/desktop/authorize?flow=test-flow",
+  "https://wcnmb.fun/desktop/authorize?flow=test-flow",
 )
 assert.equal(authorization.method, "auto")
+assert.deepEqual(_internal.AUTHORIZATION_ORIGINS, [
+  "https://wcnmb.fun",
+  "https://wcnmb.si",
+  "https://kuncode.120403.xyz",
+])
 assert.match(
   startBody.installation_id,
   /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
@@ -52,11 +57,25 @@ assert.match(
 for (const url of [
   "https://wcnmb.si/desktop/authorize?flow=test",
   "https://wcnmb.fun/desktop/authorize?flow=test",
-  "https://direct.wcnmb.fun/desktop/authorize?flow=test",
   "https://kuncode.120403.xyz/desktop/authorize?flow=test",
 ]) {
   assert.equal(_internal.isAllowedAuthorizationURL(url), true)
 }
+for (const origin of _internal.AUTHORIZATION_ORIGINS) {
+  assert.equal(
+    _internal.authorizationPageURL(
+      "https://kuncode.120403.xyz/desktop/authorize?flow=one-time",
+      origin,
+    ).toString(),
+    `${origin}/desktop/authorize?flow=one-time`,
+  )
+}
+assert.equal(
+  _internal.isAllowedAuthorizationURL(
+    "https://direct.wcnmb.fun/desktop/authorize?flow=test",
+  ),
+  false,
+)
 assert.equal(
   _internal.isAllowedAuthorizationURL(
     "https://attacker.example/desktop/authorize?flow=test",
@@ -285,6 +304,18 @@ globalThis.fetch = async (url) => {
   throw new Error(`unexpected fetch: ${url}`)
 }
 const usageHooks = await KunRouterPlugin({})
+const browserLoginMethods = usageHooks.auth.methods.filter(
+  (method) =>
+    method.type === "oauth" && method.label?.startsWith("浏览器登录"),
+)
+assert.deepEqual(
+  browserLoginMethods.map((method) => method.label),
+  [
+    "浏览器登录（推荐） · wcnmb.fun",
+    "浏览器登录 · wcnmb.si",
+    "浏览器登录 · kuncode.120403.xyz",
+  ],
+)
 const usage = await usageHooks.auth.usage(async () => ({
   type: "api",
   key: "sk-ssekey",
@@ -508,6 +539,48 @@ globalThis.fetch = async () => { throw new Error("offline") }
 const offlineModels = await usageHooks.provider.models({ models: discovered }, modelAuth)
 assert.deepEqual(offlineModels, discovered)
 assert.equal(offlineModels[Symbol.for("magpie.fellBack")], true)
+
+// 授权页默认跟随服务端 ServerAddress；显式配置时只改写已信任的授权入口。
+const previousAuthOrigin = process.env.KUNROUTER_AUTH_ORIGIN
+try {
+  process.env.KUNROUTER_AUTH_ORIGIN = "https://wcnmb.si"
+  const preferredOrigin = await import("./index.mjs?auth-origin=wcnmb-si")
+  assert.deepEqual(preferredOrigin._internal.AUTHORIZATION_ORIGINS, [
+    "https://wcnmb.si",
+    "https://wcnmb.fun",
+    "https://kuncode.120403.xyz",
+  ])
+  assert.equal(
+    preferredOrigin._internal.authorizationPageURL(
+      "https://kuncode.120403.xyz/desktop/authorize?flow=one-time",
+    ).toString(),
+    "https://wcnmb.si/desktop/authorize?flow=one-time",
+  )
+  assert.throws(
+    () => preferredOrigin._internal.authorizationPageURL(
+      "https://attacker.example/desktop/authorize?flow=one-time",
+    ),
+    /无效的授权地址/,
+  )
+
+  process.env.KUNROUTER_AUTH_ORIGIN = "https://user:pass@wcnmb.fun"
+  const invalidOrigin = await import("./index.mjs?auth-origin=invalid")
+  const invalidResult = await invalidOrigin._internal.startBrowserAuthorization()
+  assert.equal(invalidResult.type, "failed")
+  assert.match(invalidResult.error, /必须是 https:\/\/wcnmb\.fun/)
+
+  process.env.KUNROUTER_AUTH_ORIGIN = "https://attacker.example"
+  const untrustedOrigin = await import("./index.mjs?auth-origin=untrusted")
+  globalThis.fetch = async () => {
+    throw new Error("授权来源校验失败前不应请求网络")
+  }
+  const untrustedResult = await untrustedOrigin._internal.startBrowserAuthorization()
+  assert.equal(untrustedResult.type, "failed")
+  assert.match(untrustedResult.error, /必须是 https:\/\/wcnmb\.fun/)
+} finally {
+  if (previousAuthOrigin === undefined) delete process.env.KUNROUTER_AUTH_ORIGIN
+  else process.env.KUNROUTER_AUTH_ORIGIN = previousAuthOrigin
+}
 
 globalThis.fetch = realFetch
 console.log("browser authorization tests passed")

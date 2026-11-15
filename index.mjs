@@ -14,23 +14,38 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.8.4"
+const VERSION = "0.8.5"
 const MAGPIE_CLIENT_ID = "magpie"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
 const INVITE_CODE = (
   process.env.KUNROUTER_INVITE_CODE ?? "shjglbwadfbhblqvwcpqoqbo"
 ).trim()
-const AUTHORIZATION_ORIGIN =
-  process.env.KUNROUTER_AUTH_ORIGIN?.replace(/\/+$/, "") ||
-  "https://kuncode.120403.xyz"
-const TRUSTED_AUTHORIZATION_DOMAINS = [
-  "wcnmb.si",
-  "wcnmb.fun",
-  "kuncode.120403.xyz",
-  new URL(SITE).hostname,
-  new URL(API).hostname,
-  new URL(AUTHORIZATION_ORIGIN).hostname,
+const AUTHORIZATION_ORIGIN_SETTING =
+  process.env.KUNROUTER_AUTH_ORIGIN?.trim() || ""
+const PUBLIC_AUTHORIZATION_ORIGINS = [
+  "https://wcnmb.fun",
+  "https://wcnmb.si",
+  "https://kuncode.120403.xyz",
 ]
+const CONFIGURED_AUTHORIZATION_ORIGIN = normalizeAuthorizationOrigin(
+  AUTHORIZATION_ORIGIN_SETTING,
+)
+const AUTHORIZATION_ORIGIN = PUBLIC_AUTHORIZATION_ORIGINS.includes(
+  CONFIGURED_AUTHORIZATION_ORIGIN,
+)
+  ? CONFIGURED_AUTHORIZATION_ORIGIN
+  : PUBLIC_AUTHORIZATION_ORIGINS[0]
+const AUTHORIZATION_ORIGIN_INVALID =
+  Boolean(AUTHORIZATION_ORIGIN_SETTING) &&
+  !PUBLIC_AUTHORIZATION_ORIGINS.includes(CONFIGURED_AUTHORIZATION_ORIGIN)
+const AUTHORIZATION_ORIGINS = [
+  AUTHORIZATION_ORIGIN,
+  ...PUBLIC_AUTHORIZATION_ORIGINS.filter((origin) => origin !== AUTHORIZATION_ORIGIN),
+]
+const TRUSTED_AUTHORIZATION_DOMAINS = new Set([
+  ...PUBLIC_AUTHORIZATION_ORIGINS.map((origin) => new URL(origin).hostname),
+  new URL(SITE).hostname,
+])
 
 // new-api 的默认换算：500000 quota = 1 美元，站点 /api/status 会覆盖。
 const DEFAULT_QUOTA_PER_UNIT = 500000
@@ -249,15 +264,48 @@ function sameSecret(left, right) {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+function normalizeAuthorizationOrigin(value) {
+  if (!value) return ""
+  try {
+    const url = new URL(value)
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    ) return ""
+    return url.origin
+  } catch {
+    return ""
+  }
+}
+
+function authorizationPageURL(value, origin = AUTHORIZATION_ORIGIN) {
+  if (!isAllowedAuthorizationURL(value)) {
+    throw new Error("KunRouter 返回了无效的授权地址")
+  }
+  const source = new URL(value)
+  const preferredOrigin = normalizeAuthorizationOrigin(origin)
+  if (!preferredOrigin) {
+    throw new Error("KUNROUTER_AUTH_ORIGIN 不是有效的 HTTPS 域名")
+  }
+  const preferred = new URL("/desktop/authorize", preferredOrigin)
+  preferred.search = source.search
+  if (!isAllowedAuthorizationURL(preferred)) {
+    throw new Error("KUNROUTER_AUTH_ORIGIN 不是受信任的 KunRouter 地址")
+  }
+  return preferred
+}
+
 function isAllowedAuthorizationURL(value) {
   try {
     const url = new URL(String(value || ""))
     const localHTTP =
       url.protocol === "http:" &&
       (url.hostname === "127.0.0.1" || url.hostname === "localhost")
-    const trustedHost = TRUSTED_AUTHORIZATION_DOMAINS.some(
-      (domain) => url.hostname === domain || url.hostname.endsWith(`.${domain}`),
-    )
+    const trustedHost = TRUSTED_AUTHORIZATION_DOMAINS.has(url.hostname)
     // 授权只应落在授权页，不能是信任域上的任意路径。
     // 注册和登录走同一个 /desktop/authorize，用 query 区分，所以一条路径就够。
     const allowedPath = url.pathname === "/desktop/authorize"
@@ -365,6 +413,11 @@ async function startBrowserAuthorization(signal, options = {}) {
   const server = createServer()
   const lifetime = requestSignal(signal, options.timeoutMs ?? AUTHORIZATION_TIMEOUT_MS)
   try {
+    if (AUTHORIZATION_ORIGIN_INVALID) {
+      throw new Error(
+        "KUNROUTER_AUTH_ORIGIN 必须是 https://wcnmb.fun、https://wcnmb.si 或 https://kuncode.120403.xyz",
+      )
+    }
     const port = await listenLoopback(server)
     const redirectURI = `http://127.0.0.1:${port}/callback`
     const state = randomURIToken()
@@ -385,10 +438,10 @@ async function startBrowserAuthorization(signal, options = {}) {
       signal: requestSignal(lifetime),
     })
     const started = await responseJSON(res)
-    if (!isAllowedAuthorizationURL(started?.authorization_url)) {
-      throw new Error("KunRouter 返回了无效的授权地址")
-    }
-    const authorizationURL = new URL(started.authorization_url)
+    const authorizationURL = authorizationPageURL(
+      started?.authorization_url,
+      options.authorizationOrigin ?? AUTHORIZATION_ORIGIN,
+    )
     if (options.registration) {
       authorizationURL.searchParams.set("mode", "register")
       authorizationURL.searchParams.set("invite_code", INVITE_CODE)
@@ -748,20 +801,23 @@ export const KunRouterPlugin = async (input) => {
       },
     ],
     methods: [
-      {
+      ...AUTHORIZATION_ORIGINS.map((origin, index) => ({
         type: "oauth",
-        label: "浏览器授权（推荐）",
+        label: `浏览器登录${index === 0 ? "（推荐）" : ""} · ${new URL(origin).hostname}`,
         async authorize(_inputs, { signal } = {}) {
-          return startBrowserAuthorization(signal)
+          return startBrowserAuthorization(signal, { authorizationOrigin: origin })
         },
-      },
+      })),
       ...(showInvite
         ? [
             {
               type: "oauth",
               label: inviteLabel,
               async authorize(_inputs, { signal } = {}) {
-                return startBrowserAuthorization(signal, { registration: true })
+                return startBrowserAuthorization(signal, {
+                  authorizationOrigin: AUTHORIZATION_ORIGIN,
+                  registration: true,
+                })
               },
             },
           ]
@@ -1166,10 +1222,12 @@ export const KunRouterPlugin = async (input) => {
 // 给测试用，别从入口导出别的函数：magpie 会把每个导出函数都当插件调用。
 export const _internal = {
   INVITE_CODE,
+  AUTHORIZATION_ORIGINS,
   apiKeyOf,
   currentGroup,
   fetchSelf,
   fetchSubscriptions,
+  authorizationPageURL,
   inviteCodeState,
   isAllowedAuthorizationURL,
   maskKey,

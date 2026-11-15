@@ -209,7 +209,7 @@ globalThis.fetch = async (url) => {
 assert.equal(await _internal.currentGroup("nap_x", "sk-abcdefghijkl"), "付费组")
 assert.equal(await _internal.currentGroup("", "sk-abcdefghijkl"), "")
 
-// #4 流式响应里的 usage.quota 也要记下来；#7 单位跟随站点币种。
+// 钱包和订阅额度分别展示；#7 单位跟随站点币种。
 globalThis.fetch = async (url) => {
   const u = String(url)
   if (u.endsWith("/api/status")) {
@@ -249,8 +249,8 @@ globalThis.fetch = async (url) => {
                 user_id: 1,
                 plan_id: 3,
                 status: "active",
-                start_time: 1760000000,
-                end_time: 1762592000,
+                start_time: 4000000000,
+                end_time: 4002592000,
                 amount_total: 15000000,
                 amount_used: 4500000,
                 allow_wallet_overflow: true,
@@ -260,7 +260,7 @@ globalThis.fetch = async (url) => {
                     quota_limit: 500000,
                     used: 125000,
                     remaining: 375000,
-                    next_release_at: 1761000000,
+                    next_release_at: 4001000000,
                     sort_order: 0,
                   },
                 ],
@@ -300,7 +300,7 @@ assert.equal(subscription?.amount, 9)
 assert.equal(subscription?.balance, undefined)
 assert.equal(subscription?.unit, "🥚")
 assert.match(subscription?.display || "", /剩余 🥚 21\.00/)
-assert.equal(usage.plan, "Coding 月卡 · 免费鸡蛋")
+assert.equal(usage.plan, "Coding 月卡 · 免费鸡蛋（账号默认）")
 assert.ok(usage.until)
 const daily = usage.windows.find((w) => w.name === "日额度")
 assert.equal(daily?.used, 25)
@@ -309,7 +309,7 @@ assert.equal(daily?.amount, 0.25)
 assert.equal(daily?.balance, undefined)
 assert.equal(daily?.span, 86400)
 assert.ok(daily?.resetsAt)
-assert.equal(daily?.aside, true)
+assert.equal(daily?.aside, false)
 assert.equal(usage.windows.some((w) => w.name === "账号"), false)
 assert.equal(usage.windows.some((w) => w.name === "说明"), false)
 assert.equal(usage.windows.some((w) => w.name === "本期配额"), false)
@@ -426,8 +426,8 @@ const fallbackUsage = await usageHooks.auth.usage(async () => ({
   key: "sk-ssekey",
   metadata: { apiKey: "sk-ssekey", accessToken: "nap_x" },
 }))
-assert.equal(fallbackUsage.signIn, undefined)
-assert.equal(fallbackUsage.plan, "免费鸡蛋")
+assert.equal(fallbackUsage.signIn, "kept")
+assert.equal(fallbackUsage.plan, "免费鸡蛋（账号默认）")
 assert.ok(fallbackUsage.windows.some((w) => w.name === "钱包"))
 assert.equal(
   fallbackUsage.windows.find((w) => w.name === "订阅")?.display,
@@ -484,6 +484,30 @@ const noRegister = await KunRouterPlugin({
 assert.equal(noRegister.auth.methods.some((m) => /注册/.test(m.label || "")), false)
 // 默认（邀请码可用 / 未知）时注册入口存在。
 assert.equal(usageHooks.auth.methods.some((m) => /注册/.test(m.label || "")), true)
+
+// 模型发现必须返回宿主读取的完整能力和推理档位，而非 config 简写。
+let modelURL
+let modelList = [{ id: "gpt-6.1-sol" }, { id: "plain-chat" },
+  { id: "custom-thinker", supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }] },
+  { id: "gpt-6-no-think", reasoning: false }]
+globalThis.fetch = async (url) => {
+  modelURL = String(url)
+  return Response.json({ data: modelList })
+}
+const modelAuth = { auth: { type: "api", key: "sk-model-test" } }
+const discovered = await usageHooks.provider.models({ models: {} }, modelAuth)
+assert.equal(discovered["gpt-6.1-sol"].capabilities.reasoning, true)
+assert.deepEqual(Object.keys(discovered["gpt-6.1-sol"].variants), ["low", "medium", "high", "xhigh"])
+assert.equal(discovered["gpt-6.1-sol"].variants.high.reasoningEffort, "high")
+assert.equal(discovered["plain-chat"].capabilities.reasoning, false)
+assert.deepEqual(Object.keys(discovered["custom-thinker"].variants), ["low", "high"])
+assert.deepEqual(discovered["gpt-6-no-think"].variants, {})
+modelList = [{ id: "new-model" }]
+assert.deepEqual(Object.keys(await usageHooks.provider.models({ models: discovered }, modelAuth)), ["new-model"])
+globalThis.fetch = async () => { throw new Error("offline") }
+const offlineModels = await usageHooks.provider.models({ models: discovered }, modelAuth)
+assert.deepEqual(offlineModels, discovered)
+assert.equal(offlineModels[Symbol.for("magpie.fellBack")], true)
 
 globalThis.fetch = realFetch
 console.log("browser authorization tests passed")

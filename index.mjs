@@ -14,8 +14,9 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.8.5"
+const VERSION = "0.8.6"
 const MAGPIE_CLIENT_ID = "magpie"
+const ICON_URL = "https://raw.githubusercontent.com/MY-Final/opencode-kunrouter-auth/main/assets/kunrouter-icon.png"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
 const INVITE_CODE = (
   process.env.KUNROUTER_INVITE_CODE ?? "shjglbwadfbhblqvwcpqoqbo"
@@ -773,6 +774,7 @@ export const KunRouterPlugin = async (input) => {
 
   auth: {
     provider: PROVIDER,
+    icon: ICON_URL,
     // 一台机器只留一个账号：重新登录（包括手动填 Key）覆盖原来那条，
     // 而不是另开一个 kunrouter#xxxxxx。验证码/密钥填错想重来，
     // 直接再走一遍登录即可，不用先登出。

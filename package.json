@@ -1,13 +1,13 @@
 {
   "name": "opencode-kunrouter-auth",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "KunRouter (wcnmb.si) provider for OpenCode and magpie — browser sign-in, wallet and subscription quota, daily check-in",
   "type": "module",
   "main": "./index.mjs",
   "scripts": {
-    "test": "node browser-auth.test.mjs && node --test provider.test.mjs protocols.test.mjs"
+    "test": "node browser-auth.test.mjs && node --test provider.test.mjs protocols.test.mjs controls.test.mjs"
   },
-  "files": ["index.mjs", "protocols.mjs", "README.md", "CHANGELOG.md", "assets/kunrouter-icon.png"],
+  "files": ["index.mjs", "protocols.mjs", "controls.mjs", "ui", "README.md", "CHANGELOG.md", "assets/kunrouter-icon.png"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "kunrouter", "new-api"],
   "license": "MIT",
   "repository": {
@@ -16,6 +16,7 @@
   },
   "magpie": {
     "name": "KunRouter",
+    "panels": [{ "slot": "provider", "title": "Base URL", "file": "ui/index.html" }],
     "icon": "https://raw.githubusercontent.com/MY-Final/opencode-kunrouter-auth/main/assets/kunrouter-icon.png",
     "maxConcurrency": 8,
     "summary": {

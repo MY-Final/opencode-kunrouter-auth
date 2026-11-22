@@ -42,7 +42,6 @@ magpie plugin login kunrouter
 | `direct_api` | 开 | 模型请求走 `direct.wcnmb.fun`，绕开 Cloudflare 的 100 秒上限；关掉走 `wcnmb.si/v1` |
 | `period_window` | 开 | 显示全部订阅额度和滚动窗口；关掉隐藏辅助明细，仍保留当前参与路由的额度 |
 | `registration_entry` | 开 | 登录页显示注册入口；邀请码不可用时自动隐藏，关掉完全不提注册 |
-| `detect_protocols` | 关 | 获取模型时发送最小生成请求，检测每个模型支持的四种协议；开启前会提示可能产生少量费用 |
 
 改完选项要重载插件，`config` 里的供应商地址才会跟着变。
 
@@ -76,11 +75,15 @@ magpie plugin login kunrouter
 | Anthropic Messages | `/v1/messages` |
 | Gemini Generate Content | `/v1beta/models/<模型>:generateContent`，流式使用 `streamGenerateContent` |
 
-默认读取 `/v1/models` 中每个模型明确提供的 `supported_endpoint_types`（`openai`、`openai-response`、`anthropic`、`gemini`）或 `native_endpoints`。没有声明时保留宿主已有协议，首次仍使用 Chat 兼容模式；不会仅根据 GPT、Claude 或 Gemini 模型名推断协议。
+供应商编辑页的 **Base URL** 面板提供四个协议标签、地址输入框和「检测协议」按钮。默认跟随登录入口：`.si` 使用 `direct.wcnmb.si`，`.fun` 使用 `direct.wcnmb.fun`；关闭直连则使用对应登录域名。手动修改并「应用」后以该地址为准，清空即可恢复自动。检测时可填写模型 ID，留空则从列表选择。
 
-需要实测时，在 KunRouter 编辑页的「插件选项」里打开「检测模型协议」，再点「重新获取模型」。插件会尝试四种协议，并将成功结果用于模型的原生协议声明。截图中自定义供应商的「检测协议」按钮不对插件开放，这里使用 Magpie 已有的插件开关，不修改框架。
+旧版账号没有记录登录入口，需要重新登录一次才能自动匹配域名。明确设置的 `KUNROUTER_SITE` / `KUNROUTER_API` 环境变量仍然生效。
 
-每个模型最多发 4 个非流式生成请求，输出上限为 16 token；请求仍可能按上游规则计费。每轮最多检测 20 个未缓存模型、同时最多 4 个请求，单个请求最多 8 秒，一轮检测最多 10 秒；未完成的模型可在后续刷新时继续检测。结果按 API 地址、密钥和模型在内存中缓存 5 分钟，短暂失败会较早重试，重载插件后重新检测。遇到 401、限流或超时不会清除已确认的协议；HTML 页面和 JSON 错误即使返回 HTTP 200 也不算检测成功。全部未确认时保留原有声明，检测不通过不代表模型本身不可用。
+点击「检测协议」后确认一次费用提示，结果直接显示：**✓ 支持 · × 不支持 · — 未确认**。每次最多 4 个最小请求、每个输出上限 16 token；可能按上游规则计费。结果保存在插件自己的选项里，并按地址、密钥和模型隔离，重启后仍可使用。检测不会在每次刷新时自动重复。
+
+没有手动选择或检测记录时，读取模型的 `supported_endpoint_types` / `native_endpoints` 声明，未声明时保留 Chat 兼容模式。遇到限流、超时等短暂故障不将协议误判为不支持。
+
+面板使用 Magpie 的现有插件接口，检测结果通过原生 `magpie plugin options` 命令回传，不改框架、不将密钥传到页面。桌面版优先寻找启动插件的 Magpie 程序；特殊安装路径可用 `KUNROUTER_MAGPIE_BIN` 指定 CLI。
 
 Messages、Gemini 会自动使用各自的鉴权头；Gemini 路径自动调整为 `/v1beta`。密钥重签、直连域名网络故障回退和原生流式响应透传同样适用。
 

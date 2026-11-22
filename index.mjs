@@ -7,7 +7,8 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
 import { homedir, hostname } from "node:os"
-import { applyProtocols, createProtocolDetector, protocolRequest, readProtocols } from "./protocols.mjs"
+import { applyProtocols, createProtocolDetector, protocolRequest, protocolSDK, readProtocols } from "./protocols.mjs"
+import { apiRoot, publishLoginDefaults, publishProtocolReport } from "./controls.mjs"
 
 const PROVIDER = "kunrouter"
 const SITE =
@@ -15,7 +16,13 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.9.0"
+const SITE_OVERRIDE = !!process.env.KUNROUTER_SITE
+const API_OVERRIDE = !!process.env.KUNROUTER_API
+const DIRECT_BY_ORIGIN = {
+  "https://wcnmb.si": "https://direct.wcnmb.si",
+  "https://wcnmb.fun": "https://direct.wcnmb.fun",
+}
+const VERSION = "0.10.0"
 const MAGPIE_CLIENT_ID = "magpie"
 const ICON_URL = "https://raw.githubusercontent.com/MY-Final/opencode-kunrouter-auth/main/assets/kunrouter-icon.png"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
@@ -73,7 +80,7 @@ const baseModel = {
 }
 
 // 站点级配置（币种符号、quota 换算）不属于任何账号，缓存这里是安全的。
-let statusCache = { at: 0, value: null }
+const statusCache = new Map()
 // 邀请码是否还能用，也做短缓存，避免每次加载插件都打一次站点的脸。
 let inviteCache = { code: "", at: 0, value: null }
 
@@ -97,15 +104,16 @@ function authExpired(status, body) {
   return status === 401 || /^(AUTH_UNAUTHORIZED|ACCESS_TOKEN_LEGACY_RETIRED|ACCESS_TOKEN_EXPIRED)$/.test(String(body?.code || body?.message_key || ""))
 }
 
-async function siteStatus(signal) {
+async function siteStatus(signal, site = SITE) {
   const now = Date.now()
-  if (statusCache.value && now - statusCache.at < STATUS_TTL_MS) return statusCache.value
+  const cached = statusCache.get(site)
+  if (cached?.value && now - cached.at < STATUS_TTL_MS) return cached.value
   try {
-    const res = await fetch(`${SITE}/api/status`, {
+    const res = await fetch(`${site}/api/status`, {
       headers: clientHeaders(),
       signal: requestSignal(signal),
     })
-    if (!res.ok) return statusCache.value ?? {}
+    if (!res.ok) return cached?.value ?? {}
     const data = (await res.json())?.data ?? {}
     const value = {
       quotaPerUnit: finite(data.quota_per_unit) > 0 ? Number(data.quota_per_unit) : DEFAULT_QUOTA_PER_UNIT,
@@ -115,10 +123,10 @@ async function siteStatus(signal) {
       name: data.system_name || "KunRouter",
       checkinEnabled: typeof data.checkin_enabled === "boolean" ? data.checkin_enabled : undefined,
     }
-    statusCache = { at: now, value }
+    statusCache.set(site, { at: now, value })
     return value
   } catch {
-    return statusCache.value ?? {}
+    return cached?.value ?? {}
   }
 }
 
@@ -177,12 +185,12 @@ function maskKey(key) {
 
 // 额度卡上的分组别用授权时的快照：用户可能在控制台改过 Key 的分组。
 // 拿访问令牌列表里按遮罩匹配出真实分组，读不到就交给调用方退回快照。
-async function currentGroup(accessToken, apiKey, keyId, signal) {
+async function currentGroup(accessToken, apiKey, keyId, signal, site = SITE) {
   if (!accessToken || !apiKey) return ""
   const bounded = requestSignal(signal)
   try {
     if (Number.isSafeInteger(Number(keyId)) && Number(keyId) > 0) {
-      const res = await fetch(`${SITE}/api/desktop/keys/${Number(keyId)}`, {
+      const res = await fetch(`${site}/api/desktop/keys/${Number(keyId)}`, {
         headers: authHeaders(accessToken), signal: bounded,
       })
       if (res.ok) {
@@ -192,7 +200,7 @@ async function currentGroup(accessToken, apiKey, keyId, signal) {
     }
     for (let page = 1; ; page++) {
       bounded.throwIfAborted()
-      const res = await fetch(`${SITE}/api/desktop/keys?p=${page}&page_size=100`, {
+      const res = await fetch(`${site}/api/desktop/keys?p=${page}&page_size=100`, {
         headers: authHeaders(accessToken), signal: bounded,
       })
       if (!res.ok) return ""
@@ -414,6 +422,8 @@ function waitForLoopbackCallback(server, expectedState, signal) {
 
 async function startBrowserAuthorization(signal, options = {}) {
   const server = createServer()
+  const authorizationOrigin = options.authorizationOrigin ?? AUTHORIZATION_ORIGIN
+  const authorizationSite = SITE_OVERRIDE ? SITE : authorizationOrigin
   const lifetime = requestSignal(signal, options.timeoutMs ?? AUTHORIZATION_TIMEOUT_MS)
   try {
     if (AUTHORIZATION_ORIGIN_INVALID) {
@@ -421,12 +431,13 @@ async function startBrowserAuthorization(signal, options = {}) {
         "KUNROUTER_AUTH_ORIGIN 必须是 https://wcnmb.fun、https://wcnmb.si 或 https://kuncode.120403.xyz",
       )
     }
+    if (!PUBLIC_AUTHORIZATION_ORIGINS.includes(authorizationOrigin)) throw new Error("KunRouter 授权入口无效")
     const port = await listenLoopback(server)
     const redirectURI = `http://127.0.0.1:${port}/callback`
     const state = randomURIToken()
     const verifier = randomURIToken()
     const challenge = createHash("sha256").update(verifier).digest("base64url")
-    const res = await fetch(`${SITE}/api/desktop/auth/start`, {
+    const res = await fetch(`${authorizationSite}/api/desktop/auth/start`, {
       method: "POST",
       headers: { "content-type": "application/json", ...clientHeaders() },
       body: JSON.stringify({
@@ -443,7 +454,7 @@ async function startBrowserAuthorization(signal, options = {}) {
     const started = await responseJSON(res)
     const authorizationURL = authorizationPageURL(
       started?.authorization_url,
-      options.authorizationOrigin ?? AUTHORIZATION_ORIGIN,
+      authorizationOrigin,
     )
     if (options.registration) {
       authorizationURL.searchParams.set("mode", "register")
@@ -463,7 +474,7 @@ async function startBrowserAuthorization(signal, options = {}) {
       async callback() {
         try {
           const code = await callbackPromise
-          const exchange = await fetch(`${SITE}/api/desktop/auth/exchange`, {
+          const exchange = await fetch(`${authorizationSite}/api/desktop/auth/exchange`, {
             method: "POST",
             headers: { "content-type": "application/json", ...clientHeaders() },
             body: JSON.stringify({
@@ -485,7 +496,7 @@ async function startBrowserAuthorization(signal, options = {}) {
             data?.user?.username ||
             data?.user?.display_name ||
             undefined
-          return {
+          const result = {
             type: "success",
             key: apiKey,
             accountId:
@@ -494,11 +505,14 @@ async function startBrowserAuthorization(signal, options = {}) {
               accessToken,
               apiKey,
               mode: "browser",
+              authorizationOrigin,
               username,
               group: group || undefined,
               expiresAt: Number(data?.expires_at) || undefined,
             },
           }
+          await options.onAuthorized?.(result)
+          return result
         } catch (error) {
           return authorizationError(error)
         } finally {
@@ -514,25 +528,25 @@ async function startBrowserAuthorization(signal, options = {}) {
 }
 
 // /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
-async function listModels(apiKey, base = API, signal) {
+async function listModels(apiKey, base = API, signal, fallback = base === API ? SITE : null) {
   const bounded = requestSignal(signal)
   let usedBase = base
   let res
   try {
     res = await fetch(`${base}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
   } catch (error) {
-    if (base !== API || bounded.aborted || API === SITE) throw error
-    usedBase = SITE
-    res = await fetch(`${SITE}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
+    if (!fallback || bounded.aborted || base === fallback) throw error
+    usedBase = fallback
+    res = await fetch(`${fallback}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
   }
   return { ok: res.ok, status: res.status, res, base: usedBase }
 }
 
 // /api/user/self：余额查这里，也是校验令牌是否还有效的唯一办法。
-async function fetchSelf(key, signal) {
+async function fetchSelf(key, signal, site = SITE) {
   let res
   try {
-    res = await fetch(`${SITE}/api/user/self`, {
+    res = await fetch(`${site}/api/user/self`, {
       headers: authHeaders(key),
       signal: requestSignal(signal),
     })
@@ -559,14 +573,14 @@ async function fetchSelf(key, signal) {
 
 // /api/subscription/self：当前订阅、钱包/订阅计费优先级。
 // /api/subscription/plans：把 plan_id 换成套餐名；即使这里失败，订阅本身仍然能显示。
-async function fetchSubscriptions(accessToken, signal) {
+async function fetchSubscriptions(accessToken, signal, site = SITE) {
   try {
     const [selfResult, plansRes] = await Promise.all([
-      fetch(`${SITE}/api/subscription/self`, {
+      fetch(`${site}/api/subscription/self`, {
         headers: authHeaders(accessToken),
         signal: requestSignal(signal),
       }).then(async (res) => ({ res, body: await res.json().catch(() => null) })),
-      fetch(`${SITE}/api/subscription/plans`, {
+      fetch(`${site}/api/subscription/plans`, {
         headers: authHeaders(accessToken),
         signal: requestSignal(signal),
       }).then(async (res) => res.ok ? await res.json().catch(() => null) : null).catch(() => null),
@@ -701,14 +715,15 @@ function routeWindows(wallet, subscriptions, preference, known) {
 const RECOVERY_COOLDOWN_MS = 60 * 1000
 const recoveryAttempts = new Map() // 访问令牌 -> { at, promise }
 
-async function recoverApiKey(accessToken, group) {
+async function recoverApiKey(accessToken, group, site = SITE) {
   if (!accessToken) return null
-  const cached = recoveryAttempts.get(accessToken)
+  const cacheKey = JSON.stringify([site, accessToken])
+  const cached = recoveryAttempts.get(cacheKey)
   if (cached && Date.now() - cached.at < RECOVERY_COOLDOWN_MS) {
     return cached.promise.catch(() => null)
   }
   const promise = (async () => {
-    const res = await fetch(`${SITE}/api/desktop/keys`, {
+    const res = await fetch(`${site}/api/desktop/keys`, {
       method: "POST",
       headers: { "content-type": "application/json", ...authHeaders(accessToken) },
       // group 为空时站点按账号默认分组签发，和首次授权一致。
@@ -720,7 +735,7 @@ async function recoverApiKey(accessToken, group) {
     if (!key.startsWith("sk-")) return null
     return { key, group: String(data?.group || ""), id: data?.id }
   })()
-  recoveryAttempts.set(accessToken, { at: Date.now(), promise })
+  recoveryAttempts.set(cacheKey, { at: Date.now(), promise })
   return promise.catch(() => null)
 }
 
@@ -746,17 +761,66 @@ async function saveRecoveredAuth(client, auth, recovered) {
   }
 }
 
-export const KunRouterPlugin = async (input) => {
+export const KunRouterPlugin = async (input, settings = {}) => {
   // magpie 的选项框：plugins.json 里这一项的 options，按供应商 id 读。
   const opt = (key, fallback) => {
     const v = input?.magpie?.option?.(PROVIDER, key)
     return typeof v === "boolean" ? v : fallback
   }
   // 直连域名绕开 Cloudflare 的 100 秒上限；关掉就走主站 /v1。
-  const apiBase = () => (opt("direct_api", true) ? API : SITE)
+  const endpoints = (auth, manual = true) => {
+    const savedOrigin = normalizeAuthorizationOrigin(auth?.metadata?.authorizationOrigin ?? settings.authorization_origin ?? "")
+    const origin = PUBLIC_AUTHORIZATION_ORIGINS.includes(savedOrigin) ? savedOrigin : ""
+    const site = SITE_OVERRIDE || !origin ? SITE : origin
+    const direct = API_OVERRIDE || !origin ? API : DIRECT_BY_ORIGIN[origin] ?? origin
+    const base = manual && settings.api_base ? apiRoot(settings.api_base) : opt("direct_api", true) ? direct : site
+    return { base, site, fallback: !settings.api_base && opt("direct_api", true) && base !== site ? site : null }
+  }
+  const apiBase = (auth) => endpoints(auth).base
+  const onAuthorized = async (auth) => {
+    if (!input?.magpie) return
+    try {
+      await publishLoginDefaults(auth.metadata.authorizationOrigin, `${endpoints(auth, false).base}/${settings.protocol === "gemini" ? "v1beta" : "v1"}`)
+    } catch { /* Auth metadata still retains the selected domain if the UI sync fails. */ }
+  }
   // Magpie 用 0 让目录和用户设置决定窗口；OpenCode 旧版的 0 会关闭自动压缩，保留其兼容默认值。
   const contextFallback = input?.magpie ? baseModel.limit.context : 128000
   const detectProtocols = createProtocolDetector()
+  let probeRun
+  const request = settings.protocol_probe
+  const needsProbe = process.env.KUNROUTER_REPORT_WRITER !== "1" && request && typeof request.id === "string" && request.id.length <= 100
+    && request.id !== settings.protocol_report?.id
+  const runPanelProbe = (models, auth, base, error) => {
+    if (!needsProbe) return Promise.resolve()
+    return probeRun ??= (async () => {
+      const key = apiKeyOf(auth)
+      const credential = key ? createHash("sha256").update(key).digest("hex") : ""
+      let report = { id: request.id, status: "error", error: "请先登录，再检测协议" }
+      const support = { ...settings.protocol_support }
+      try {
+        if (error) throw new Error(error)
+        if (!key) throw new Error(report.error)
+        const id = typeof request.model === "string" ? request.model.trim() : ""
+        if (id.length > 200) throw new Error("模型 ID 过长")
+        const model = id ? models[id] ?? { id } : Object.values(models)[0]
+        if (!model) throw new Error("请填写一个模型 ID")
+        let details
+        const detect = createProtocolDetector({ maxModels: 1, onResult: (result) => { details = result.results } })
+        const result = await detect([model], key, base)
+        const protocols = result.get(model.id) ?? []
+        report = { id: request.id, status: "done", model: model.id, results: ["chat", "responses", "anthropic", "gemini"].map((protocol) => ({
+          protocol, status: details?.[protocol] ?? "unknown",
+        })) }
+        if (protocols.length) support[model.id] = { base: apiBase(auth), credential, protocols }
+        for (const old of Object.keys(support).slice(0, Math.max(0, Object.keys(support).length - 64))) delete support[old]
+      } catch (e) { report.error = e.message }
+      try {
+        await publishProtocolReport(settings, report, support)
+      } catch {
+        await input?.client?.tui?.showToast?.({ body: { variant: "error", message: "检测结果未能保存，请检查 Magpie 命令是否可用" } })
+      }
+    })()
+  }
 
   // 注册入口要先确认邀请码还能用，用不了就别把入口摆出来（#6）。
   // 关掉 registration_entry 开关也能隐藏它（#12）。
@@ -798,30 +862,18 @@ export const KunRouterPlugin = async (input) => {
     maxConcurrency: 8,
     options: [
       {
-        key: "detect_protocols",
-        label: "检测模型协议",
-        description: "刷新模型时检测 Chat、Responses、Messages 和 Gemini。每轮最多检测 20 个未缓存模型，结果缓存 5 分钟。",
-        confirm: "协议检测会向每个模型发送最多 4 个最小生成请求，可能产生少量费用。是否开启？",
-        default: false,
-      },
-      {
         key: "direct_api",
         label: "走直连域名",
-        description:
-          "默认走直连域名，避免长请求被 Cloudflare 的 100 秒上限打断；关掉改走主站。",
         default: true,
       },
       {
         key: "period_window",
         label: "显示订阅额度",
-        description:
-          "开（默认）：显示全部订阅额度和滚动窗口。关掉隐藏辅助明细，仍保留当前参与路由的额度。",
         default: true,
       },
       {
         key: "registration_entry",
         label: "显示注册入口",
-        description: "登录页显示注册入口；邀请码不可用时自动隐藏。",
         default: true,
       },
     ],
@@ -830,7 +882,7 @@ export const KunRouterPlugin = async (input) => {
         type: "oauth",
         label: `浏览器登录${index === 0 ? "（推荐）" : ""} · ${new URL(origin).hostname}`,
         async authorize(_inputs, { signal } = {}) {
-          return startBrowserAuthorization(signal, { authorizationOrigin: origin })
+          return startBrowserAuthorization(signal, { authorizationOrigin: origin, onAuthorized })
         },
       })),
       ...(showInvite
@@ -841,6 +893,7 @@ export const KunRouterPlugin = async (input) => {
               async authorize(_inputs, { signal } = {}) {
                 return startBrowserAuthorization(signal, {
                   authorizationOrigin: AUTHORIZATION_ORIGIN,
+                  onAuthorized,
                   registration: true,
                 })
               },
@@ -875,7 +928,7 @@ export const KunRouterPlugin = async (input) => {
           const apiKey = String(inputs?.apiKey ?? "").trim()
           if (!token) return { type: "failed", error: "访问令牌不能为空" }
 
-          const self = await fetchSelf(token)
+          const self = await fetchSelf(token, undefined, endpoints().site)
           if (self.error) {
             return {
               type: "failed",
@@ -885,7 +938,8 @@ export const KunRouterPlugin = async (input) => {
 
           // 顺手验一下 sk- 能不能列模型，省得进了列表才发现拉不到。
           if (apiKey) {
-            const probe = await listModels(apiKey, apiBase()).catch(() => null)
+            const { base, fallback } = endpoints()
+            const probe = await listModels(apiKey, base, undefined, fallback).catch(() => null)
             if (!probe) return { type: "failed", error: "API 密钥连不上 /v1/models，确认一下是不是复制全了" }
             if (!probe.ok) return { type: "failed", error: `API 密钥被拒绝（HTTP ${probe.status}）` }
           }
@@ -910,7 +964,7 @@ export const KunRouterPlugin = async (input) => {
       // 与其让请求打出去 401，不如当场给一句能看懂的话：这把账号只能看余额和签到。
       if (!apiKey) {
         return {
-          baseURL: `${apiBase()}/v1`,
+          baseURL: `${apiBase(auth)}/v1`,
           async fetch() {
             return new Response(
               JSON.stringify({
@@ -926,8 +980,9 @@ export const KunRouterPlugin = async (input) => {
         }
       }
       let key = apiKey
+      const selected = endpoints(auth)
       return {
-        baseURL: `${apiBase()}/v1`,
+        baseURL: `${selected.base}/v1`,
         async fetch(input, init) {
           const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined)
           const replayable = !(input instanceof Request && input.body) && (
@@ -936,20 +991,20 @@ export const KunRouterPlugin = async (input) => {
           const send = (secret, base) => {
             // loader 已经用 apiBase 拼好完整 URL，回退时把直连域名换回主站。
             const url = input instanceof Request ? input.url : String(input)
-            const target = base === SITE && url.startsWith(`${API}/`)
-              ? `${SITE}${url.slice(API.length)}` : url
+            const target = base !== selected.base && url.startsWith(`${selected.base}/`)
+              ? `${base}${url.slice(selected.base.length)}` : url
             const wire = protocolRequest(target, init?.headers ?? (input instanceof Request ? input.headers : undefined), secret)
             for (const [k, v] of Object.entries(clientHeaders())) wire.headers.set(k, v)
             return fetch(input instanceof Request ? new Request(wire.url, input) : wire.url, { ...init, headers: wire.headers })
           }
           let res
-          let base = apiBase()
+          let base = selected.base
           try {
             res = await send(key, base)
           } catch (error) {
             // 直连域名网络层挂了（DNS / 连不上）时回退一次主站，别让明明还能用的站白等。
-            if (base === API && replayable && !signal?.aborted && error?.name !== "AbortError") {
-              base = SITE
+            if (selected.fallback && replayable && !signal?.aborted && error?.name !== "AbortError") {
+              base = selected.fallback
               res = await send(key, base)
             } else {
               throw error
@@ -957,7 +1012,7 @@ export const KunRouterPlugin = async (input) => {
           }
           // Key 被控制台删掉后 /v1 会直接 401。访问令牌还能用就重签一把再试。
           if (res.status === 401 && !signal?.aborted) {
-            const recovered = await recoverApiKey(tokenOf(auth), auth?.metadata?.group)
+            const recovered = await recoverApiKey(tokenOf(auth), auth?.metadata?.group, selected.site)
             if (recovered?.key) {
               key = recovered.key
               await saveRecoveredAuth(client, auth, recovered)
@@ -981,11 +1036,12 @@ export const KunRouterPlugin = async (input) => {
 
       // 全部读取共享一个预算，并行开始，辅助信息不会再串行增加 10 秒。
       const bounded = requestSignal(signal)
+      const site = endpoints(auth).site
       const [status, self, subscriptionData, liveGroup] = await Promise.all([
-        siteStatus(bounded),
-        token ? fetchSelf(token, bounded) : Promise.resolve(null),
-        token ? fetchSubscriptions(token, bounded) : Promise.resolve(null),
-        token && apiKey ? currentGroup(token, apiKey, auth.metadata?.apiKeyId, bounded) : Promise.resolve(""),
+        siteStatus(bounded, site),
+        token ? fetchSelf(token, bounded, site) : Promise.resolve(null),
+        token ? fetchSubscriptions(token, bounded, site) : Promise.resolve(null),
+        token && apiKey ? currentGroup(token, apiKey, auth.metadata?.apiKeyId, bounded, site) : Promise.resolve(""),
       ])
       const unit = status.quotaPerUnit || DEFAULT_QUOTA_PER_UNIT
       const sym = status.symbol || "$"
@@ -1174,11 +1230,12 @@ export const KunRouterPlugin = async (input) => {
 
       // 先确认站点开启签到；状态读取和签到共享一次请求预算。
       const bounded = requestSignal(signal)
-      const status = await siteStatus(bounded)
+      const site = endpoints(auth).site
+      const status = await siteStatus(bounded, site)
       if (status.checkinEnabled === false) return { outcome: "inactive", message: "站点未开启每日签到" }
       let res
       try {
-        res = await fetch(`${SITE}/api/user/checkin`, {
+        res = await fetch(`${site}/api/user/checkin`, {
           method: "POST",
           headers: { ...authHeaders(key), "content-type": "application/json" },
           body: "{}",
@@ -1215,35 +1272,55 @@ export const KunRouterPlugin = async (input) => {
   provider: {
     id: PROVIDER,
     async models(provider, { auth, signal } = {}) {
-      if (auth?.type !== "api") return provider.models
+      const selected = endpoints(auth)
+      if (auth?.type !== "api") {
+        await runPanelProbe({}, auth, selected.base)
+        return provider.models
+      }
       const key = apiKeyOf(auth)
-      if (!key) return provider.models
+      if (!key) {
+        await runPanelProbe({}, auth, selected.base)
+        return provider.models
+      }
       const fallback = () => Object.defineProperty({ ...provider.models }, Symbol.for("magpie.fellBack"), { value: true })
 
       let list, detectionBase
       try {
-        const { res, base } = await listModels(key, apiBase(), signal)
+        const { res, base } = await listModels(key, selected.base, signal, selected.fallback)
         detectionBase = base
-        if (!res.ok) return fallback()
+        if (!res.ok) {
+          await runPanelProbe({}, auth, base, `获取模型失败（${res.status}）`)
+          return fallback()
+        }
         const body = await res.json()
-        if (!Array.isArray(body?.data)) return fallback()
+        if (!Array.isArray(body?.data)) {
+          await runPanelProbe({}, auth, base, "模型列表格式无效")
+          return fallback()
+        }
         list = body.data
       } catch {
+        if (!signal?.aborted) await runPanelProbe({}, auth, selected.base, "无法连接模型接口")
         return fallback()
       }
 
       const out = {}
+      const credential = createHash("sha256").update(key).digest("hex")
       for (const m of list) {
         const id = typeof m?.id === "string" ? m.id : ""
         if (!id) continue
-        const info = modelInfo(m, provider.models?.[id], apiBase(), contextFallback)
-        const protocols = readProtocols(m)
-        out[id] = protocols ? applyProtocols(info, protocols, apiBase()) : info
+        const info = modelInfo(m, provider.models?.[id], selected.base, contextFallback)
+        const saved = settings.protocol_support?.[id]
+        const cached = saved?.base === selected.base && saved.credential === credential && Array.isArray(saved.protocols) ? saved.protocols : undefined
+        const preferred = protocolSDK(settings.protocol)
+        const protocols = cached ?? readProtocols(m) ?? (preferred ? [settings.protocol] : undefined)
+        if (preferred && protocols?.includes(settings.protocol)) info.api.npm = preferred
+        out[id] = protocols ? applyProtocols(info, protocols, selected.base) : info
       }
+      if (!signal?.aborted) await runPanelProbe(out, auth, detectionBase)
       if (opt("detect_protocols", false)) {
         const detected = await detectProtocols(Object.values(out), key, detectionBase, signal)
         if (signal?.aborted) return fallback()
-        for (const [id, protocols] of detected) out[id] = applyProtocols(out[id], protocols, apiBase())
+        for (const [id, protocols] of detected) out[id] = applyProtocols(out[id], protocols, selected.base)
       }
       return out
     },

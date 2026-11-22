@@ -7,6 +7,7 @@ const SDK = {
   gemini: "@ai-sdk/google",
 }
 const ORDER = Object.keys(SDK)
+export const protocolSDK = (protocol) => ORDER.includes(protocol) ? SDK[protocol] : undefined
 
 function protocolOf(value) {
   if (typeof value !== "string") return undefined
@@ -88,7 +89,7 @@ function validReply(protocol, body) {
 }
 
 // Opt-in generation probes: small requests, bounded work, per-credential cache, no credentials on disk.
-export function createProtocolDetector({ timeoutMs = 8000, budgetMs = 10000, ttlMs = 300000, concurrency = 4, maxModels = 20 } = {}) {
+export function createProtocolDetector({ timeoutMs = 8000, budgetMs = 10000, ttlMs = 300000, concurrency = 4, maxModels = 20, onResult } = {}) {
   const cache = new Map()
   return async (models, key, base, signal) => {
     const out = new Map()
@@ -106,6 +107,7 @@ export function createProtocolDetector({ timeoutMs = 8000, budgetMs = 10000, ttl
       const remembered = cache.get(cacheKey)
       if (remembered?.until > now) {
         out.set(model.id, mergeProtocols(model, remembered.results))
+        onResult?.({ model: model.id, results: remembered.results })
       } else if (pending.length < maxModels) pending.push({ model, cacheKey, results: {}, previous: remembered?.results })
       else if (remembered) out.set(model.id, mergeProtocols(model, remembered.results))
     }
@@ -143,6 +145,7 @@ export function createProtocolDetector({ timeoutMs = 8000, budgetMs = 10000, ttl
         if (result !== "unknown" || !results[protocol]) results[protocol] = result
       }
       out.set(item.model.id, mergeProtocols(item.model, results))
+      onResult?.({ model: item.model.id, results })
       if (!signal?.aborted && Object.keys(item.results).length === ORDER.length) {
         // Transient failures are retried sooner; an aborted detection never becomes cached truth.
         const unknown = Object.values(item.results).includes("unknown")

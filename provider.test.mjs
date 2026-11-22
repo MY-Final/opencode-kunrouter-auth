@@ -405,9 +405,7 @@ test("streaming usage, cached tokens, tool calls and charge fields pass through 
 
 test("model discovery declares native APIs from metadata without generation probes by default", async () => {
   const hooks = await plugin()
-  const detection = hooks.auth.options.find((o) => o.key === "detect_protocols")
-  assert.equal(detection.default, false)
-  assert.match(detection.confirm, /费用/)
+  assert.equal(hooks.auth.options.some((o) => o.key === "detect_protocols"), false)
   globalThis.fetch = async (url, init) => {
     assert.equal(init?.method, undefined)
     assert.match(String(url), /\/v1\/models$/)
@@ -531,4 +529,105 @@ test("protocol detection follows the successful model-list domain after network 
   assert.equal(models.native.api.npm, "@ai-sdk/openai")
   assert.equal(probes.length, 4)
   assert.equal(probes.every((url) => url.startsWith("https://wcnmb.si/")), true)
+})
+
+test("models and loader follow each account's chosen login domain", async () => {
+  const hooks = await plugin()
+  for (const [origin, base] of [
+    ["https://wcnmb.si", "https://direct.wcnmb.si"],
+    ["https://wcnmb.fun", "https://direct.wcnmb.fun"],
+    ["https://kuncode.120403.xyz", "https://kuncode.120403.xyz"],
+  ]) {
+    const account = { ...auth, metadata: { ...auth.metadata, authorizationOrigin: origin } }
+    const urls = []
+    globalThis.fetch = async (url) => {
+      urls.push(String(url))
+      assert.equal(new URL(String(url)).origin, base)
+      return Response.json({ data: [{ id: "native" }] })
+    }
+    const models = await hooks.provider.models({ models: {} }, { auth: account })
+    assert.equal(models.native.api.url, `${base}/v1`)
+    const loader = await hooks.auth.loader(async () => account)
+    assert.equal(loader.baseURL, `${base}/v1`)
+    await loader.fetch(`${base}/v1/responses`, { method: "POST", body: "{}" })
+    assert.equal(urls.length, 2)
+  }
+})
+
+test("si login never crosses to fun on model-list or native request fallback", async () => {
+  const hooks = await plugin({ detect_protocols: true })
+  const account = { ...auth, metadata: { ...auth.metadata, authorizationOrigin: "https://wcnmb.si" } }
+  const urls = []
+  globalThis.fetch = async (url) => {
+    urls.push(String(url))
+    assert.equal(String(url).includes("wcnmb.fun"), false)
+    if (String(url).startsWith("https://direct.wcnmb.si")) throw new Error("direct offline")
+    if (String(url).endsWith("/v1/models")) return Response.json({ data: [{ id: "native" }] })
+    return String(url).endsWith("/responses") ? Response.json({ object: "response", output: [] }) : new Response(null, { status: 404 })
+  }
+  const models = await hooks.provider.models({ models: {} }, { auth: account })
+  assert.equal(models.native.api.npm, "@ai-sdk/openai")
+  const loader = await hooks.auth.loader(async () => account)
+  await loader.fetch("https://direct.wcnmb.si/v1/responses", { method: "POST", body: "{}" })
+  assert.equal(urls.at(-1), "https://wcnmb.si/v1/responses")
+})
+
+test("a manual Base URL overrides the login domain and never silently falls back to another host", async () => {
+  const settings = { api_base: "https://custom.example/v1" }
+  const hooks = await KunRouterPlugin({ magpie: { option: () => false } }, settings)
+  const account = { ...auth, metadata: { ...auth.metadata, authorizationOrigin: "https://wcnmb.si" } }
+  let hits = 0
+  globalThis.fetch = async (url) => {
+    hits++
+    assert.equal(new URL(String(url)).origin, "https://custom.example")
+    throw new Error("custom offline")
+  }
+  const models = await hooks.provider.models({ models: { old: {} } }, { auth: account })
+  assert.equal(models[Symbol.for("magpie.fellBack")], true)
+  const loader = await hooks.auth.loader(async () => account)
+  assert.equal(loader.baseURL, "https://custom.example/v1")
+  await assert.rejects(loader.fetch("https://custom.example/v1/responses", { method: "POST", body: "{}" }))
+  assert.equal(hits, 2)
+})
+
+test("si browser authorization exchanges on si and remembers the selected origin", async () => {
+  let start
+  const urls = []
+  globalThis.fetch = async (url, init) => {
+    urls.push(String(url))
+    if (String(url).endsWith("/start")) {
+      start = JSON.parse(init.body)
+      return Response.json({ success: true, data: { authorization_url: "https://wcnmb.fun/desktop/authorize?flow=test" } })
+    }
+    return Response.json({ success: true, data: { access_token: "pat", api_key: "sk-test" } })
+  }
+  const flow = await _internal.startBrowserAuthorization(undefined, { authorizationOrigin: "https://wcnmb.si" })
+  assert.equal(new URL(flow.url).origin, "https://wcnmb.si")
+  const resultPromise = flow.callback()
+  const callback = new URL(start.redirect_uri)
+  callback.searchParams.set("state", start.state)
+  callback.searchParams.set("code", "test-code")
+  await realFetch(callback)
+  const result = await resultPromise
+  assert.equal(result.type, "success")
+  assert.equal(result.metadata.authorizationOrigin, "https://wcnmb.si")
+  assert.equal(urls.every((url) => new URL(url).origin === "https://wcnmb.si"), true)
+})
+
+test("quota and check-in management requests follow the chosen login domain too", async () => {
+  const hooks = await plugin()
+  const account = { ...auth, metadata: { ...auth.metadata, authorizationOrigin: "https://wcnmb.fun" } }
+  serveUsage()
+  const serve = globalThis.fetch
+  const urls = []
+  globalThis.fetch = async (url, init) => {
+    urls.push(String(url))
+    assert.equal(new URL(String(url)).origin, "https://wcnmb.fun")
+    if (String(url).endsWith("/api/user/checkin")) return Response.json({ success: true, data: { quota_awarded: 500000 } })
+    return serve(url, init)
+  }
+  await hooks.auth.usage(async () => account)
+  assert.equal((await hooks.auth.checkin(async () => account)).outcome, "claimed")
+  assert.equal(urls.some((url) => url.endsWith("/api/user/self")), true)
+  assert.equal(urls.some((url) => url.endsWith("/api/subscription/self")), true)
 })

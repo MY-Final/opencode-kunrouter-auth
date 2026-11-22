@@ -14,7 +14,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.8.6"
+const VERSION = "0.8.7"
 const MAGPIE_CLIENT_ID = "magpie"
 const ICON_URL = "https://raw.githubusercontent.com/MY-Final/opencode-kunrouter-auth/main/assets/kunrouter-icon.png"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
@@ -66,7 +66,8 @@ const DEFAULT_MODELS = {
 }
 
 const baseModel = {
-  limit: { context: 128000, output: 8192 },
+  // 0 表示未知，交给宿主目录或用户设置；猜出的 128K 会被当成真实上限。
+  limit: { context: 0, output: 8192 },
   tool_call: true,
 }
 
@@ -611,7 +612,7 @@ function quotaWindowLabel(seconds) {
   return `${durationLabel(seconds)}额度`
 }
 
-function modelInfo(model, previous, base) {
+function modelInfo(model, previous, base, contextFallback) {
   const id = model.id
   const levels = model.supported_reasoning_levels ?? model.reasoning_levels
   const explicit = Array.isArray(levels)
@@ -635,7 +636,14 @@ function modelInfo(model, previous, base) {
     if (Array.isArray(kinds)) capabilities[kind] = Object.fromEntries(
       ["text", "image", "audio", "video", "pdf"].map((name) => [name, kinds.includes(name)]))
   }
-  const positive = (value, fallback) => finite(value) > 0 ? Number(value) : fallback
+  const positive = (...values) => {
+    for (const value of values) {
+      if (typeof value !== "number" && typeof value !== "string") continue
+      const n = finite(value)
+      if (n > 0) return n
+    }
+    return 0
+  }
   return {
     ...previous,
     id, providerID: PROVIDER,
@@ -643,8 +651,8 @@ function modelInfo(model, previous, base) {
     api: { ...previous?.api, id, url: `${base}/v1`, npm: previous?.api?.npm ?? "@ai-sdk/openai-compatible" },
     limit: {
       ...previous?.limit,
-      context: positive(model.limit?.context ?? model.context_window, previous?.limit?.context ?? baseModel.limit.context),
-      output: positive(model.limit?.output ?? model.max_output_tokens, previous?.limit?.output ?? baseModel.limit.output),
+      context: positive(model.limit?.context, model.context_window, model.context_length, previous?.limit?.context, contextFallback),
+      output: positive(model.limit?.output, model.max_output_tokens, previous?.limit?.output, baseModel.limit.output),
     },
     headers: previous?.headers ?? {}, options: previous?.options ?? {},
     cost: previous?.cost ?? { input: 0, output: 0, cache: { read: 0, write: 0 } },
@@ -743,6 +751,8 @@ export const KunRouterPlugin = async (input) => {
   }
   // 直连域名绕开 Cloudflare 的 100 秒上限；关掉就走主站 /v1。
   const apiBase = () => (opt("direct_api", true) ? API : SITE)
+  // Magpie 用 0 让目录和用户设置决定窗口；OpenCode 旧版的 0 会关闭自动压缩，保留其兼容默认值。
+  const contextFallback = input?.magpie ? baseModel.limit.context : 128000
 
   // 注册入口要先确认邀请码还能用，用不了就别把入口摆出来（#6）。
   // 关掉 registration_entry 开关也能隐藏它（#12）。
@@ -767,7 +777,9 @@ export const KunRouterPlugin = async (input) => {
       website: SITE,
       keys: `${SITE}/console/token`,
       models: Object.fromEntries(
-        Object.entries(DEFAULT_MODELS).map(([id, name]) => [id, { ...baseModel, name }]),
+        Object.entries(DEFAULT_MODELS).map(([id, name]) => [id, {
+          ...baseModel, name, limit: { ...baseModel.limit, context: contextFallback },
+        }]),
       ),
     }
   },
@@ -1213,7 +1225,7 @@ export const KunRouterPlugin = async (input) => {
       for (const m of list) {
         const id = typeof m?.id === "string" ? m.id : ""
         if (!id) continue
-        out[id] = modelInfo(m, provider.models?.[id], apiBase())
+        out[id] = modelInfo(m, provider.models?.[id], apiBase(), contextFallback)
       }
       return out
     },

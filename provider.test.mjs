@@ -239,6 +239,78 @@ test("model discovery consumes advertised limits, modalities and explicit reason
   assert.deepEqual(models.known.variants.high, { custom: true })
 })
 
+test("unknown model windows stay unknown in config, discovery and failed discovery", async () => {
+  const hooks = await plugin()
+  const config = {}
+  await hooks.config(config)
+  const placeholders = config.provider.kunrouter.models
+  for (const model of Object.values(placeholders)) assert.equal(model.limit.context, 0)
+
+  const ids = [...Object.keys(placeholders), "unlisted-alias"]
+  globalThis.fetch = async () => Response.json({ data: ids.map((id) => ({ id })) })
+  const models = await hooks.provider.models({ models: placeholders }, { auth })
+  for (const id of ids) {
+    assert.equal(models[id].limit.context, 0, id)
+    assert.equal(models[id].limit.output, 8192, id)
+  }
+
+  const refreshed = await hooks.provider.models({ models }, { auth })
+  for (const id of ids) assert.equal(refreshed[id].limit.context, 0, id)
+
+  globalThis.fetch = async () => new Response(null, { status: 503 })
+  const fallback = await hooks.provider.models({ models: placeholders }, { auth })
+  assert.equal(fallback[Symbol.for("magpie.fellBack")], true)
+  for (const model of Object.values(fallback)) assert.equal(model.limit.context, 0)
+})
+
+test("model discovery resolves context aliases without inventing or shrinking windows", async () => {
+  const hooks = await plugin()
+  const cases = [
+    { id: "nested", limit: { context: 1000000 }, expected: 1000000 },
+    { id: "window", context_window: 1000000, expected: 1000000 },
+    { id: "length", context_length: "1000000", expected: 1000000 },
+    { id: "precedence", limit: { context: 200000 }, context_window: 400000, context_length: 1000000, expected: 200000 },
+    { id: "zero-nested", limit: { context: 0 }, context_window: 1000000, expected: 1000000 },
+    { id: "bad-window", context_window: "invalid", context_length: 1000000, expected: 1000000 },
+    { id: "negative-nested", limit: { context: -1 }, context_length: 1000000, expected: 1000000 },
+    { id: "known", expected: 400000 },
+    { id: "bad-previous", expected: 0 },
+    { id: "explicit-128k", context_window: 128000, expected: 128000 },
+    { id: "replace-old-default", context_length: 1000000, expected: 1000000 },
+    ...[null, 0, -1, "", "invalid", "Infinity", true, [], {}].map((value, i) => ({
+      id: `invalid-${i}`, limit: { context: value }, context_window: value, context_length: value, expected: 0,
+    })),
+  ]
+  const previous = {
+    known: { limit: { context: 400000, input: 350000, output: 32000 } },
+    "bad-previous": { limit: { context: -1 } },
+    "explicit-128k": { limit: { context: 1000000 } },
+    "replace-old-default": { limit: { context: 128000 } },
+  }
+  globalThis.fetch = async () => Response.json({ data: cases.map(({ expected, ...model }) => model) })
+  const models = await hooks.provider.models({ models: previous }, { auth })
+  for (const { id, expected } of cases) assert.equal(models[id].limit.context, expected, id)
+  assert.deepEqual(models.known.limit, previous.known.limit)
+  assert.equal(previous["replace-old-default"].limit.context, 128000)
+
+  // A later response containing only ids must retain previously advertised limits.
+  globalThis.fetch = async () => Response.json({ data: [{ id: "length" }] })
+  const refreshed = await hooks.provider.models({ models }, { auth })
+  assert.equal(refreshed.length.limit.context, 1000000)
+})
+
+test("standalone OpenCode keeps its compaction-compatible default and honors configured windows", async () => {
+  globalThis.fetch = async () => Response.json({ data: [{ id: "unknown" }, { id: "configured" }, { id: "advertised", context_length: 1000000 }] })
+  const hooks = await KunRouterPlugin({})
+  const config = {}
+  await hooks.config(config)
+  for (const model of Object.values(config.provider.kunrouter.models)) assert.equal(model.limit.context, 128000)
+  const models = await hooks.provider.models({ models: { configured: { limit: { context: 1000000 } } } }, { auth })
+  assert.equal(models.unknown.limit.context, 128000)
+  assert.equal(models.configured.limit.context, 1000000)
+  assert.equal(models.advertised.limit.context, 1000000)
+})
+
 test("model verification and discovery use selected domain, with one network fallback", async () => {
   const paths = []
   const hooks = await plugin({ direct_api: false })

@@ -7,6 +7,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
 import { homedir, hostname } from "node:os"
+import { applyProtocols, createProtocolDetector, protocolRequest, readProtocols } from "./protocols.mjs"
 
 const PROVIDER = "kunrouter"
 const SITE =
@@ -14,7 +15,7 @@ const SITE =
 const API =
   process.env.KUNROUTER_API?.replace(/\/+$/, "") ||
   "https://direct.wcnmb.fun" // 直连 /v1，不受 CF 超时限制
-const VERSION = "0.8.7"
+const VERSION = "0.9.0"
 const MAGPIE_CLIENT_ID = "magpie"
 const ICON_URL = "https://raw.githubusercontent.com/MY-Final/opencode-kunrouter-auth/main/assets/kunrouter-icon.png"
 // 活动邀请码。改活动时优先用环境变量覆盖，不用改代码发版。
@@ -515,14 +516,16 @@ async function startBrowserAuthorization(signal, options = {}) {
 // /v1/models：只有 sk- 密钥能调，访问令牌到这里是 401。
 async function listModels(apiKey, base = API, signal) {
   const bounded = requestSignal(signal)
+  let usedBase = base
   let res
   try {
     res = await fetch(`${base}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
   } catch (error) {
     if (base !== API || bounded.aborted || API === SITE) throw error
+    usedBase = SITE
     res = await fetch(`${SITE}/v1/models`, { headers: authHeaders(apiKey), signal: bounded })
   }
-  return { ok: res.ok, status: res.status, res }
+  return { ok: res.ok, status: res.status, res, base: usedBase }
 }
 
 // /api/user/self：余额查这里，也是校验令牌是否还有效的唯一办法。
@@ -753,6 +756,7 @@ export const KunRouterPlugin = async (input) => {
   const apiBase = () => (opt("direct_api", true) ? API : SITE)
   // Magpie 用 0 让目录和用户设置决定窗口；OpenCode 旧版的 0 会关闭自动压缩，保留其兼容默认值。
   const contextFallback = input?.magpie ? baseModel.limit.context : 128000
+  const detectProtocols = createProtocolDetector()
 
   // 注册入口要先确认邀请码还能用，用不了就别把入口摆出来（#6）。
   // 关掉 registration_entry 开关也能隐藏它（#12）。
@@ -793,6 +797,13 @@ export const KunRouterPlugin = async (input) => {
     single: true,
     maxConcurrency: 8,
     options: [
+      {
+        key: "detect_protocols",
+        label: "检测模型协议",
+        description: "刷新模型时检测 Chat、Responses、Messages 和 Gemini。每轮最多检测 20 个未缓存模型，结果缓存 5 分钟。",
+        confirm: "协议检测会向每个模型发送最多 4 个最小生成请求，可能产生少量费用。是否开启？",
+        default: false,
+      },
       {
         key: "direct_api",
         label: "走直连域名",
@@ -923,14 +934,13 @@ export const KunRouterPlugin = async (input) => {
             init?.body == null || typeof init.body === "string" ||
             init.body instanceof Uint8Array || init.body instanceof ArrayBuffer)
           const send = (secret, base) => {
-            const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
-            headers.set("authorization", `Bearer ${secret}`)
-            for (const [k, v] of Object.entries(clientHeaders())) headers.set(k, v)
             // loader 已经用 apiBase 拼好完整 URL，回退时把直连域名换回主站。
             const url = input instanceof Request ? input.url : String(input)
             const target = base === SITE && url.startsWith(`${API}/`)
               ? `${SITE}${url.slice(API.length)}` : url
-            return fetch(input instanceof Request ? new Request(target, input) : target, { ...init, headers })
+            const wire = protocolRequest(target, init?.headers ?? (input instanceof Request ? input.headers : undefined), secret)
+            for (const [k, v] of Object.entries(clientHeaders())) wire.headers.set(k, v)
+            return fetch(input instanceof Request ? new Request(wire.url, input) : wire.url, { ...init, headers: wire.headers })
           }
           let res
           let base = apiBase()
@@ -1210,9 +1220,10 @@ export const KunRouterPlugin = async (input) => {
       if (!key) return provider.models
       const fallback = () => Object.defineProperty({ ...provider.models }, Symbol.for("magpie.fellBack"), { value: true })
 
-      let list
+      let list, detectionBase
       try {
-        const { res } = await listModels(key, apiBase(), signal)
+        const { res, base } = await listModels(key, apiBase(), signal)
+        detectionBase = base
         if (!res.ok) return fallback()
         const body = await res.json()
         if (!Array.isArray(body?.data)) return fallback()
@@ -1225,7 +1236,14 @@ export const KunRouterPlugin = async (input) => {
       for (const m of list) {
         const id = typeof m?.id === "string" ? m.id : ""
         if (!id) continue
-        out[id] = modelInfo(m, provider.models?.[id], apiBase(), contextFallback)
+        const info = modelInfo(m, provider.models?.[id], apiBase(), contextFallback)
+        const protocols = readProtocols(m)
+        out[id] = protocols ? applyProtocols(info, protocols, apiBase()) : info
+      }
+      if (opt("detect_protocols", false)) {
+        const detected = await detectProtocols(Object.values(out), key, detectionBase, signal)
+        if (signal?.aborted) return fallback()
+        for (const [id, protocols] of detected) out[id] = applyProtocols(out[id], protocols, apiBase())
       }
       return out
     },

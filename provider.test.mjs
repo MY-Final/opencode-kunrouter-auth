@@ -402,3 +402,133 @@ test("streaming usage, cached tokens, tool calls and charge fields pass through 
   assert.equal(result, response)
   assert.equal(await result.text(), chunks.join(""))
 })
+
+test("model discovery declares native APIs from metadata without generation probes by default", async () => {
+  const hooks = await plugin()
+  const detection = hooks.auth.options.find((o) => o.key === "detect_protocols")
+  assert.equal(detection.default, false)
+  assert.match(detection.confirm, /费用/)
+  globalThis.fetch = async (url, init) => {
+    assert.equal(init?.method, undefined)
+    assert.match(String(url), /\/v1\/models$/)
+    return Response.json({ data: [
+      { id: "multi", supported_endpoint_types: ["openai", "openai-response", "anthropic", "gemini"] },
+      { id: "responses-only", native_endpoints: ["/v1/responses"] },
+      { id: "messages-only", supported_endpoint_types: ["anthropic"] },
+      { id: "gemini-only", supported_endpoint_types: ["gemini"] },
+    ] })
+  }
+  const models = await hooks.provider.models({ models: {} }, { auth })
+  assert.equal(models.multi.api.npm, "@ai-sdk/openai-compatible")
+  assert.deepEqual(models.multi.also, ["@ai-sdk/openai", "@ai-sdk/anthropic", "@ai-sdk/google"])
+  assert.equal(models["responses-only"].api.npm, "@ai-sdk/openai")
+  assert.equal(models["messages-only"].api.npm, "@ai-sdk/anthropic")
+  assert.equal(models["gemini-only"].api.npm, "@ai-sdk/google")
+  assert.equal(models["gemini-only"].api.url, "https://direct.wcnmb.fun/v1beta")
+})
+
+test("opt-in protocol detection updates native routing and reuses its cache", async () => {
+  const hooks = await plugin({ detect_protocols: true })
+  let generations = 0
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith("/v1/models")) return Response.json({ data: [{ id: "dual" }] })
+    generations++
+    assert.equal(init.method, "POST")
+    if (String(url).endsWith("/responses")) return Response.json({ object: "response", output: [] })
+    if (String(url).endsWith("/messages")) return Response.json({ type: "message", content: [] })
+    return new Response(null, { status: 404 })
+  }
+  const models = await hooks.provider.models({ models: {} }, { auth })
+  assert.equal(generations, 4)
+  assert.equal(models.dual.api.npm, "@ai-sdk/openai")
+  assert.deepEqual(models.dual.also, ["@ai-sdk/anthropic"])
+  const refreshed = await hooks.provider.models({ models: {} }, { auth })
+  assert.equal(generations, 4)
+  assert.deepEqual(refreshed.dual.api, models.dual.api)
+})
+
+test("all native protocol streams keep their bodies and use the requested API's credentials", async () => {
+  const loader = await (await plugin()).auth.loader(getAuth)
+  for (const [path, expectedPath, keyHeader] of [
+    ["/v1/responses", "/v1/responses", "authorization"],
+    ["/v1/messages", "/v1/messages", "x-api-key"],
+    ["/v1/models/provider%2Fgemini:streamGenerateContent?alt=sse&key=old", "/v1beta/models/provider%2Fgemini:streamGenerateContent?alt=sse", "x-goog-api-key"],
+  ]) {
+    const body = JSON.stringify({ untouched: path })
+    const reply = new Response('data: {"native":true}\n\n', { headers: { "content-type": "text/event-stream" } })
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), `https://direct.wcnmb.fun${expectedPath}`)
+      assert.equal(init.body, body)
+      assert.equal(init.headers.get(keyHeader), keyHeader === "authorization" ? `Bearer ${auth.key}` : auth.key)
+      assert.equal(init.headers.get("x-custom"), "kept")
+      if (keyHeader === "x-api-key") assert.equal(init.headers.get("anthropic-version"), "2023-06-01")
+      return reply
+    }
+    const result = await loader.fetch(`https://direct.wcnmb.fun${path}`, {
+      method: "POST", body, headers: { "x-api-key": "old", "x-goog-api-key": "old", "x-custom": "kept" },
+    })
+    assert.equal(result, reply)
+    assert.equal(await result.text(), 'data: {"native":true}\n\n')
+  }
+})
+
+test("key recovery replaces native Messages and Gemini credentials on retry", async () => {
+  for (const [path, header] of [["/v1/messages", "x-api-key"], ["/v1/models/gemini:generateContent?key=old", "x-goog-api-key"]]) {
+    const loader = await (await plugin()).auth.loader(async () => ({
+      ...auth, metadata: { ...auth.metadata, accessToken: `pat-native-${header}` },
+    }))
+    const keys = []
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith("/api/desktop/keys")) return Response.json({ success: true, data: { key: "sk-recovered" } })
+      assert.equal(new URL(String(url)).searchParams.has("key"), false)
+      keys.push(init.headers.get(header))
+      return new Response(null, { status: keys.length === 1 ? 401 : 200 })
+    }
+    const result = await loader.fetch(`https://direct.wcnmb.fun${path}`, { method: "POST", body: "{}" })
+    assert.equal(result.status, 200)
+    assert.deepEqual(keys, [auth.key, "sk-recovered"])
+  }
+})
+
+test("Gemini's native path survives direct-domain network fallback", async () => {
+  const loader = await (await plugin()).auth.loader(getAuth)
+  const paths = []
+  globalThis.fetch = async (url, init) => {
+    paths.push(String(url))
+    assert.match(String(url), /\/v1beta\/models\/gemini:streamGenerateContent\?alt=sse$/)
+    assert.equal(init.headers.get("x-goog-api-key"), auth.key)
+    if (String(url).startsWith("https://direct.wcnmb.fun")) throw new Error("offline")
+    return new Response(null, { status: 200 })
+  }
+  assert.equal((await loader.fetch("https://direct.wcnmb.fun/v1/models/gemini:streamGenerateContent?alt=sse", { method: "POST", body: "{}" })).status, 200)
+  assert.equal(paths[1], "https://wcnmb.si/v1beta/models/gemini:streamGenerateContent?alt=sse")
+})
+
+test("cancelling protocol detection retains the prior model list", async () => {
+  const hooks = await plugin({ detect_protocols: true })
+  const controller = new AbortController()
+  globalThis.fetch = async (url) => {
+    if (String(url).endsWith("/v1/models")) return Response.json({ data: [{ id: "new" }] })
+    controller.abort()
+    throw controller.signal.reason
+  }
+  const models = await hooks.provider.models({ models: { previous: {} } }, { auth, signal: controller.signal })
+  assert.equal(models[Symbol.for("magpie.fellBack")], true)
+  assert.deepEqual(Object.keys(models), ["previous"])
+})
+
+test("protocol detection follows the successful model-list domain after network fallback", async () => {
+  const hooks = await plugin({ detect_protocols: true })
+  const probes = []
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith("https://direct.wcnmb.fun")) throw new Error("direct offline")
+    if (String(url).endsWith("/v1/models")) return Response.json({ data: [{ id: "native" }] })
+    assert.equal(init.method, "POST")
+    probes.push(String(url))
+    return String(url).endsWith("/responses") ? Response.json({ object: "response", output: [] }) : new Response(null, { status: 404 })
+  }
+  const models = await hooks.provider.models({ models: {} }, { auth })
+  assert.equal(models.native.api.npm, "@ai-sdk/openai")
+  assert.equal(probes.length, 4)
+  assert.equal(probes.every((url) => url.startsWith("https://wcnmb.si/")), true)
+})

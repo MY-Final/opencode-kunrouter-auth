@@ -42,6 +42,7 @@ magpie plugin login kunrouter
 | `direct_api` | 开 | 模型请求走 `direct.wcnmb.fun`，绕开 Cloudflare 的 100 秒上限；关掉走 `wcnmb.si/v1` |
 | `period_window` | 开 | 显示全部订阅额度和滚动窗口；关掉隐藏辅助明细，仍保留当前参与路由的额度 |
 | `registration_entry` | 开 | 登录页显示注册入口；邀请码不可用时自动隐藏，关掉完全不提注册 |
+| `detect_protocols` | 关 | 获取模型时发送最小生成请求，检测每个模型支持的四种协议；开启前会提示可能产生少量费用 |
 
 改完选项要重载插件，`config` 里的供应商地址才会跟着变。
 
@@ -63,6 +64,25 @@ magpie plugin login kunrouter
 上下文窗口依次读取接口的 `limit.context`、`context_window`、`context_length`，无效值会跳过，再保留宿主已有的有效窗口。在 Magpie 中，均未提供时以 `0` 表示未知，不再将猜测的 128K 上报成模型上限，窗口交给宿主目录或用户设置。接口明确声明的较小窗口仍会保留。独立使用 OpenCode 时保留原有的 128K 兼容默认值，避免旧版因窗口为 `0` 而关闭自动压缩；可以在 OpenCode 模型配置中设置窗口。
 
 升级后请在 KunRouter 供应商页点击「重新获取模型」，再重启 Codex 并新建会话，让模型信息更新；插件不会改写 Codex 自己的 `model_context_window` 配置。
+
+### 多协议与检测
+
+插件可向 Magpie 声明一个模型支持多个原生协议，让客户端使用对应协议连接：
+
+| 协议 | 站点端点 |
+| --- | --- |
+| OpenAI Chat Completions | `/v1/chat/completions` |
+| OpenAI Responses | `/v1/responses` |
+| Anthropic Messages | `/v1/messages` |
+| Gemini Generate Content | `/v1beta/models/<模型>:generateContent`，流式使用 `streamGenerateContent` |
+
+默认读取 `/v1/models` 中每个模型明确提供的 `supported_endpoint_types`（`openai`、`openai-response`、`anthropic`、`gemini`）或 `native_endpoints`。没有声明时保留宿主已有协议，首次仍使用 Chat 兼容模式；不会仅根据 GPT、Claude 或 Gemini 模型名推断协议。
+
+需要实测时，在 KunRouter 编辑页的「插件选项」里打开「检测模型协议」，再点「重新获取模型」。插件会尝试四种协议，并将成功结果用于模型的原生协议声明。截图中自定义供应商的「检测协议」按钮不对插件开放，这里使用 Magpie 已有的插件开关，不修改框架。
+
+每个模型最多发 4 个非流式生成请求，输出上限为 16 token；请求仍可能按上游规则计费。每轮最多检测 20 个未缓存模型、同时最多 4 个请求，单个请求最多 8 秒，一轮检测最多 10 秒；未完成的模型可在后续刷新时继续检测。结果按 API 地址、密钥和模型在内存中缓存 5 分钟，短暂失败会较早重试，重载插件后重新检测。遇到 401、限流或超时不会清除已确认的协议；HTML 页面和 JSON 错误即使返回 HTTP 200 也不算检测成功。全部未确认时保留原有声明，检测不通过不代表模型本身不可用。
+
+Messages、Gemini 会自动使用各自的鉴权头；Gemini 路径自动调整为 `/v1beta`。密钥重签、直连域名网络故障回退和原生流式响应透传同样适用。
 
 用量读取并行开始，共享 10 秒预算并响应宿主取消；套餐名称、分组等辅助信息失败会独立降级。403 权限不足不会直接标记账号过期；签到关闭时不发送签到请求。浏览器授权启动和兑换各有 10 秒网络超时，整个授权最多等待 5 分钟，取消或超时后释放本地回调端口。
 

@@ -2,6 +2,7 @@
   const $ = (id) => document.getElementById(id)
   const form = $("settings"), address = $("base-url"), model = $("model")
   const detect = $("detect"), status = $("status"), results = $("results")
+  const apply = $("apply")
   const tabs = [...document.querySelectorAll("[data-protocol]")]
   const labels = { chat: "Chat", responses: "Responses", anthropic: "Messages", gemini: "Gemini" }
   let protocol = "chat", busy = false, armed = false, loaded = false, addressEdited = false
@@ -28,6 +29,7 @@
       tab.tabIndex = active ? 0 : -1
     }
     if (adjust) {
+      apply.hidden = false
       address.value = address.value.replace(/\/(v1|v1beta)\/?$/, protocol === "gemini" ? "/v1beta" : "/v1")
       disarm()
       say()
@@ -78,6 +80,7 @@
       else next.api_base = value
     }
     const saved = await magpie.options.set(next)
+    apply.hidden = true
     addressEdited = false
     address.value = (saved.api_base || saved.default_api_base || "")
       .replace(/\/(v1|v1beta)\/?$/, protocol === "gemini" ? "/v1beta" : "/v1")
@@ -102,7 +105,7 @@
     })
   }
   for (const field of [address, model]) field.addEventListener("input", () => { disarm(); say() })
-  address.addEventListener("input", () => { addressEdited = true })
+  address.addEventListener("input", () => { addressEdited = true; apply.hidden = false })
   form.addEventListener("submit", async (event) => {
     event.preventDefault()
     if (!loaded || busy || !valid()) return

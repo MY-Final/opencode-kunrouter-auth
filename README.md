@@ -64,29 +64,6 @@ magpie plugin login kunrouter
 
 升级后请在 KunRouter 供应商页点击「重新获取模型」，再重启 Codex 并新建会话，让模型信息更新；插件不会改写 Codex 自己的 `model_context_window` 配置。
 
-### 多协议与检测
-
-插件可向 Magpie 声明一个模型支持多个原生协议，让客户端使用对应协议连接：
-
-| 协议 | 站点端点 |
-| --- | --- |
-| OpenAI Chat Completions | `/v1/chat/completions` |
-| OpenAI Responses | `/v1/responses` |
-| Anthropic Messages | `/v1/messages` |
-| Gemini Generate Content | `/v1beta/models/<模型>:generateContent`，流式使用 `streamGenerateContent` |
-
-供应商编辑页的 **Base URL** 面板提供四个协议标签、地址输入框和「检测协议」按钮。默认跟随登录入口：`.si` 使用 `direct.wcnmb.si`，`.fun` 使用 `direct.wcnmb.fun`；关闭直连则使用对应登录域名。手动修改并「应用」后以该地址为准，清空即可恢复自动。检测时可填写模型 ID，留空则从列表选择。
-
-旧版账号没有记录登录入口，需要重新登录一次才能自动匹配域名。明确设置的 `KUNROUTER_SITE` / `KUNROUTER_API` 环境变量仍然生效。
-
-点击「检测协议」后确认一次费用提示，结果直接显示：**✓ 支持 · × 不支持 · — 未确认**。每次最多 4 个最小请求、每个输出上限 16 token；可能按上游规则计费。结果保存在插件自己的选项里，并按地址、密钥和模型隔离，重启后仍可使用。检测不会在每次刷新时自动重复。
-
-没有手动选择或检测记录时，读取模型的 `supported_endpoint_types` / `native_endpoints` 声明，未声明时保留 Chat 兼容模式。遇到限流、超时等短暂故障不将协议误判为不支持。
-
-面板使用 Magpie 的现有插件接口，检测结果通过原生 `magpie plugin options` 命令回传，不改框架、不将密钥传到页面。桌面版优先寻找启动插件的 Magpie 程序；特殊安装路径可用 `KUNROUTER_MAGPIE_BIN` 指定 CLI。
-
-Messages、Gemini 会自动使用各自的鉴权头；Gemini 路径自动调整为 `/v1beta`。密钥重签、直连域名网络故障回退和原生流式响应透传同样适用。
-
 用量读取并行开始，共享 10 秒预算并响应宿主取消；套餐名称、分组等辅助信息失败会独立降级。403 权限不足不会直接标记账号过期；签到关闭时不发送签到请求。浏览器授权启动和兑换各有 10 秒网络超时，整个授权最多等待 5 分钟，取消或超时后释放本地回调端口。
 
 ## 域名

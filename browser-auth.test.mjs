@@ -106,7 +106,6 @@ assert.equal(result.key, "sk-browser_api_key")
 assert.equal(result.accountId, "42")
 assert.equal(result.metadata.accessToken, "nap_browser_access")
 assert.equal(result.metadata.group, "vip")
-assert.equal(result.metadata.authorizationOrigin, "https://wcnmb.fun")
 assert.equal(exchangeBody.code, "one-time-code")
 assert.equal(exchangeBody.redirect_uri, startBody.redirect_uri)
 
